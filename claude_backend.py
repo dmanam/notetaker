@@ -33,10 +33,11 @@ import shutil
 import sys
 from pathlib import Path
 
-from media import extract_frame
+from media import extract_frame, format_timestamp, parse_timestamp
 from notes_tools import (FRAME_READER_PROMPT, NotesToolContext, ToolResult,
-                         build_handlers, build_tools, ensure_broker,
-                         format_answers, is_open)
+                         backfill_question_timestamps, build_handlers,
+                         build_tools, ensure_broker, format_answers, is_open)
+from usage import Usage, format_usage, usage_from_claude_code
 
 BACKENDS = ("subscription", "codex", "api")
 
@@ -56,8 +57,14 @@ ASYNC_QA_INSTRUCTION = """
 Questions to the user (ask_user, clarify_transcript) are asynchronous: the
 tool queues the question and returns immediately, and the user answers while
 you keep working. Do not stop and wait for an answer. Adopt your best
-provisional version, mark the spot with \\todo{awaiting answer #N}, and
-continue. Call get_user_answers before you finish, to incorporate answers
+provisional version, mark the spot with
+\\todo{awaiting answer #N @ hh:mm:ss}, and continue. Always give the question
+a timestamp, copied from the transcript line it arose from: it is how the
+user finds the moment in the video, and a question they cannot locate is a
+question they cannot answer. Tell ask_user what your provisional choice was,
+and clarify_transcript your best guess — the answer may come back in a
+follow-up run, where you are a fresh context with no memory of either, and
+a reply of "yes, that one" is only usable if you are told what you proposed. Call get_user_answers before you finish, to incorporate answers
 that have already arrived; answers that arrive by the end of your pass are
 delivered in a follow-up turn, in which you revise the file (apply the
 answers and remove the resolved \\todo markers) rather than rewriting it.
@@ -139,16 +146,36 @@ def save_questions(ctx: NotesToolContext, output_file: Path) -> None:
     }, indent=2))
 
 
+def open_question_count(output_file: Path) -> int:
+    """How many questions an earlier run left open for this file (no
+    prompting — used to survey a course before a follow-up pass)."""
+    qf = questions_file_for(output_file)
+    if not qf.exists():
+        return 0
+    try:
+        saved = json.loads(qf.read_text()).get("questions", [])
+    except (OSError, ValueError):
+        return 0
+    return sum(1 for q in saved if is_open(q))
+
+
 def count_todos(text: str) -> int:
     return len(re.findall(r"\\todo\b", text))
 
 
-def collect_followup_answers(ctx: NotesToolContext,
-                             output_file: Path) -> str | None:
+def collect_followup_answers(ctx: NotesToolContext, output_file: Path,
+                             segments: list[dict] | None = None) -> str | None:
     """Re-ask the questions left open by earlier runs. Returns a formatted
     answers block for the ones the user answered now (re-deferred ones stay
     open), or None if there were no open questions."""
     load_saved_questions(ctx, output_file)
+    if segments:
+        # Questions queued before timestamps were recorded can still be
+        # located in the transcript.
+        filled = backfill_question_timestamps(ctx.questions, segments)
+        if filled:
+            print(f"(recovered timestamps for {filled} earlier question(s))",
+                  file=sys.stderr)
     open_qs = [q for q in ctx.questions if is_open(q)]
     if not open_qs:
         return None
@@ -215,6 +242,7 @@ def run_agent(
             # Keep the previous version and let us detect the agent's write.
             output_file.rename(backup)
 
+    ctx.usage = Usage()  # filled by the backend; read by callers afterwards
     system_prompt = system_prompt + ASYNC_QA_INSTRUCTION + RESEARCH_INSTRUCTION
     full_user = user_text + _write_instruction(backend, output_file, revise)
     if summary_file is not None:
@@ -274,6 +302,8 @@ def run_agent(
         text = fallback
 
     save_questions(ctx, output_file)
+    if ctx.usage.any():
+        print(f"\nLLM usage: {format_usage(ctx.usage)}", file=sys.stderr)
     n_open = sum(1 for q in ctx.questions if is_open(q))
     n_todo = count_todos(text)
     if n_open or n_todo:
@@ -362,10 +392,11 @@ def _analyze_frames_tool(frame_model: str) -> dict:
             "properties": {
                 "timestamps": {
                     "type": "array",
-                    "items": {"type": "number"},
-                    "description": ("Timestamps in seconds (up to 8). Include "
-                                    "a few nearby moments for a clear view of "
-                                    "the board."),
+                    "items": {"type": ["number", "string"]},
+                    "description": ("Up to 8 positions in the video, as "
+                                    "hh:mm:ss (as the transcript gives them) "
+                                    "or seconds. Include a few nearby moments "
+                                    "for a clear view of the board."),
                 },
                 "question": {
                     "type": "string",
@@ -478,15 +509,21 @@ def _run_api(system_prompt: str, user_text: str, ctx: NotesToolContext,
         })
 
     def analyze_frames(inp: dict) -> ToolResult:
-        stamps = [float(t) for t in inp["timestamps"]][:8]
-        print(f"\n  [analyze_frames @ {', '.join(f'{t:.0f}s' for t in stamps)}"
+        stamps = [t for t in (parse_timestamp(x) for x in inp["timestamps"])
+                  if t is not None][:8]
+        if not stamps:
+            return ToolResult("Error: no readable timestamps — use hh:mm:ss "
+                              "or a number of seconds.", is_error=True)
+        print(f"\n  [analyze_frames @ "
+              f"{', '.join(format_timestamp(t) for t in stamps)}"
               f" → {frame_model}]", end="", flush=True)
         content = []
         for ts in stamps:
             b64 = extract_frame(ctx.video_path, ts)
             ctx.frame_requests += 1
             if b64:
-                content.append({"type": "text", "text": f"Frame at {ts:.1f}s:"})
+                content.append({"type": "text",
+                                "text": f"Frame at {format_timestamp(ts)}:"})
                 content.append({
                     "type": "image",
                     "source": {"type": "base64", "media_type": "image/jpeg",
@@ -508,6 +545,7 @@ def _run_api(system_prompt: str, user_text: str, ctx: NotesToolContext,
             system=FRAME_READER_PROMPT,
             messages=[{"role": "user", "content": content}],
         )
+        ctx.usage.add_anthropic_response(frame_model, reply.usage)
         text = "".join(b.text for b in reply.content if b.type == "text")
         return ToolResult(f"Frame report ({len(stamps)} frame(s)):\n{text}")
 
@@ -574,6 +612,7 @@ def _run_api(system_prompt: str, user_text: str, ctx: NotesToolContext,
                 print(flush=True)
             response = stream.get_final_message()
 
+        ctx.usage.add_anthropic_response(model, response.usage)
         messages.append({"role": "assistant", "content": response.content})
         for block in response.content:
             if block.type == "text":
@@ -776,6 +815,7 @@ def _run_subscription(system_prompt: str, user_text: str,
 
     async def _main() -> str:
         parts: list[str] = []
+        final_result: list = [None]  # latest ResultMessage (cumulative usage)
 
         async def drain(client) -> None:
             async for message in client.receive_response():
@@ -789,9 +829,11 @@ def _run_subscription(system_prompt: str, user_text: str,
                             line = _tool_line(block.name, block.input)
                             if line:
                                 print(line, flush=True)
-                elif isinstance(message, ResultMessage) and message.is_error:
-                    raise RuntimeError(
-                        f"Claude Code returned an error: {message.result}")
+                elif isinstance(message, ResultMessage):
+                    final_result[0] = message
+                    if message.is_error:
+                        raise RuntimeError(
+                            f"Claude Code returned an error: {message.result}")
 
         async with ClaudeSDKClient(options=options) as client:
             await client.query(user_text)
@@ -809,6 +851,12 @@ def _run_subscription(system_prompt: str, user_text: str,
                       f"{len(items)} answer(s)]", flush=True)
                 await client.query(_revision_message(items))
                 await drain(client)
+
+        # The last ResultMessage carries cumulative usage for the session
+        # and the API-equivalent cost as computed by Claude Code.
+        if final_result[0] is not None:
+            rm = final_result[0]
+            ctx.usage.add(usage_from_claude_code(rm.usage, rm.total_cost_usd))
         return "".join(parts)
 
     try:
@@ -841,9 +889,10 @@ tool. Only read frames yourself when the subagent's report is ambiguous,
 incomplete, or mathematically implausible and the passage is important."""
 
 
-def _stream_codex(cmd: list[str], prompt: str) -> str | None:
+def _stream_codex(cmd: list[str], prompt: str) -> tuple[str | None, int | None]:
     """Run a codex command, streaming its output through, feeding the prompt
-    on stdin, and capturing the session id from the header."""
+    on stdin, and capturing the session id from the header plus the token
+    count from the footer. Returns (session_id, tokens_used)."""
     import re
     import subprocess
     import threading
@@ -863,15 +912,19 @@ def _stream_codex(cmd: list[str], prompt: str) -> str | None:
     threading.Thread(target=feed, daemon=True).start()
 
     session_id = None
+    tokens = None
     for line in proc.stdout:
         print(line, end="", flush=True)
         if session_id is None:
             m = re.search(r"session id: ([0-9a-fA-F-]{16,})", line)
             if m:
                 session_id = m.group(1)
+        m = re.search(r"[Tt]okens used:?\s*([\d,]+)", line)
+        if m:
+            tokens = int(m.group(1).replace(",", ""))
     if proc.wait() != 0:
         raise SystemExit(f"codex failed (exit code {proc.returncode})")
-    return session_id
+    return session_id, tokens
 
 
 def _run_codex(system_prompt: str, user_text: str, ctx: NotesToolContext,
@@ -939,7 +992,7 @@ def _run_codex(system_prompt: str, user_text: str, ctx: NotesToolContext,
 
         # Codex has no separate system-prompt channel in exec mode.
         prompt = f"<instructions>\n{system_prompt}\n</instructions>\n\n{user_text}"
-        session_id = _stream_codex(
+        session_id, tokens = _stream_codex(
             [codex, "exec",
              "--sandbox", "workspace-write",
              "--cd", str(output_file.parent)]
@@ -947,6 +1000,7 @@ def _run_codex(system_prompt: str, user_text: str, ctx: NotesToolContext,
             + ["--output-last-message", str(last_msg), "-"],
             prompt,
         )
+        total_tokens = tokens or 0
         ctx.merge_state()
 
         # Revision rounds: deliver answers that arrived during the run by
@@ -968,11 +1022,16 @@ def _run_codex(system_prompt: str, user_text: str, ctx: NotesToolContext,
             print(f"\n  [revision round {round_num}: delivering "
                   f"{len(items)} answer(s)]", flush=True)
             ctx.dump(ctx_file)  # refresh question_seq for the resumed server
-            _stream_codex(
+            _, tokens = _stream_codex(
                 [codex, "exec", "resume"] + config_flags
                 + ["--output-last-message", str(last_msg), session_id, "-"],
                 _revision_message(items),
             )
+            total_tokens += tokens or 0
             ctx.merge_state()
+
+        if total_tokens:
+            ctx.usage.note = (f"codex reported {total_tokens:,} total tokens; "
+                              f"no price table for GPT models")
 
         return last_msg.read_text() if last_msg.exists() else ""

@@ -51,16 +51,20 @@ def main() -> None:
     @server.tool(name="clarify_transcript",
                  description=specs["clarify_transcript"]["description"])
     def clarify_transcript(transcript_text: str, context: str,
-                           guess: str = "") -> str:
+                           timestamp: str = "", guess: str = "") -> str:
         return _text(handlers["clarify_transcript"]({
             "transcript_text": transcript_text,
             "context": context,
+            "timestamp": timestamp,
             "guess": guess,
         }))
 
     @server.tool(name="ask_user", description=specs["ask_user"]["description"])
-    def ask_user(question: str) -> str:
-        return _text(handlers["ask_user"]({"question": question}))
+    def ask_user(question: str, timestamp: str = "",
+                 provisional: str = "") -> str:
+        return _text(handlers["ask_user"]({"question": question,
+                                           "timestamp": timestamp,
+                                           "provisional": provisional}))
 
     @server.tool(name="get_user_answers",
                  description=specs["get_user_answers"]["description"])
@@ -73,6 +77,15 @@ def main() -> None:
         # files_mode: the handler saves a PNG and returns its path.
         return _text(handlers["view_pdf_page"]({"path": path, "page": page}))
 
+    if "cite_reference" in handlers:
+        @server.tool(name="cite_reference",
+                     description=specs["cite_reference"]["description"])
+        def cite_reference(url_or_id: str, title: str = "",
+                           author: str = "", year: str = "") -> str:
+            return _text(handlers["cite_reference"](
+                {"url_or_id": url_or_id, "title": title,
+                 "author": author, "year": year}))
+
     if "add_to_preamble" in handlers:
         @server.tool(name="add_to_preamble",
                      description=specs["add_to_preamble"]["description"])
@@ -84,12 +97,12 @@ def main() -> None:
             # File mode (codex): the handler saves a JPEG and returns its path.
             @server.tool(name="get_frame",
                          description=specs["get_frame"]["description"])
-            def get_frame(timestamp: float) -> str:
+            def get_frame(timestamp: float | str) -> str:
                 return _text(handlers["get_frame"]({"timestamp": timestamp}))
         else:
             @server.tool(name="get_frame",
                          description=specs["get_frame"]["description"])
-            def get_frame(timestamp: float) -> Image:
+            def get_frame(timestamp: float | str) -> Image:
                 result = handlers["get_frame"]({"timestamp": timestamp})
                 if result.is_error:
                     raise RuntimeError(str(result.content))

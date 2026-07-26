@@ -36,7 +36,7 @@ from pathlib import Path
 
 from claude_backend import (BACKENDS, collect_followup_answers, count_todos,
                             run_agent)
-from latex_check import report_latex_check
+from latex_check import check_latex, print_errors
 from fetch import describe_assets, fetch_reference
 from media import find_video, format_transcript
 from notes_tools import NotesToolContext
@@ -92,13 +92,85 @@ Guidelines:
 - Clean up speech disfluencies (um, uh, repetitions) but preserve the
   lecturer's explanations faithfully.
 - Add \label{} and \ref{} cross-references where appropriate.
-- Do not invent mathematics not present in the lecture.
-- The transcript provides timestamps [MM:SS] before each segment. Use them
-  only to decide *when* to call get_frame — do not include them in the output.
+- Do not invent mathematics not present in the lecture. Material you add that
+  the lecturer did not say — a justification, an "equivalently", a slicker
+  proof, a historical attribution — is where errors concentrate. Add it only
+  where you are certain, never present your own reasoning as the lecturer's,
+  and mark a genuinely useful gloss as yours ("Editorially: ...").
+- Preserve the lecturer's confidence. "I think", "morally speaking", "I
+  forgot", "I don't know" are content, not disfluency: keep them. Never turn
+  a hedge into an assertion, or state as settled something the lecturer
+  flagged as open or half-remembered.
+- A correction supersedes what it corrects. Lecturers correct themselves and
+  audiences correct them, sometimes much later in the hour. Write what the
+  lecture concluded — do not restate a retracted claim, and do not reuse a
+  refuted example as though it still supported the point.
+- Never attribute a reference the lecturer did not give. Anything you cite as
+  the work they meant must predate the lecture; a later paper can be cited,
+  but as your own "see also".
+- A \todo does not license a false statement: assert only what you are sure
+  of and put the uncertainty inside the \todo.
+- The transcript provides timestamps [hh:mm:ss] before each segment. Use them
+  to decide when to call get_frame, and to stamp any question you queue for
+  the user — do not include them in the notes themselves.
 
 Write the complete LaTeX document (starting with \documentclass) to the output
 file named in the task instructions. Do not put the LaTeX source in your reply
 text."""
+
+
+# ---------------------------------------------------------------------------
+# Compile check, with the model fixing what it broke
+# ---------------------------------------------------------------------------
+
+def check_and_fix(output_path: Path, ctx_factory, backend: str,
+                  model: str | None, frame_model: str | None,
+                  fix_rounds: int = 2) -> None:
+    """Compile-check the notes; on failure hand the errors back to the model
+    and re-check, up to fix_rounds times."""
+    for attempt in range(fix_rounds + 1):
+        errors = check_latex(output_path)
+        if errors is None:
+            print("(no LaTeX toolchain found on PATH — skipping compile check)")
+            return
+        if not errors:
+            print(f"Compile check OK: {output_path.name}")
+            return
+        print_errors(output_path, errors)
+        if attempt == fix_rounds:
+            break
+        lines = output_path.read_text().splitlines()
+        listed = []
+        for err in errors:
+            item = f"- {err.message}"
+            if err.line is not None:
+                src = (lines[err.line - 1].strip()
+                       if 0 < err.line <= len(lines) else "")
+                item += f"\n  at line {err.line}" + (f": {src}" if src else "")
+            if err.detail:
+                item += "\n  LaTeX said:\n" + "\n".join(
+                    "    " + ln for ln in err.detail.splitlines())
+            listed.append(item)
+        print(f"\nFixing (round {attempt + 1}/{fix_rounds})…", flush=True)
+        ctx = ctx_factory()
+        run_agent(
+            system_prompt=SYSTEM_PROMPT,
+            user_text=(
+                f"`{output_path}` does not compile:\n\n" + "\n".join(listed)
+                + "\n\nRead the file and fix these errors. Keep the "
+                  "mathematics exactly as it is — you are correcting LaTeX, "
+                  "not rewriting content. If a macro or environment is "
+                  "genuinely missing, add the definition (or the package) to "
+                  "the preamble. Edit the file in place."),
+            ctx=ctx,
+            output_file=output_path,
+            backend=backend,
+            model=model,
+            frame_model=frame_model,
+            revise=True,
+        )
+    print("  Remaining errors need a manual look "
+          "(or another --latex-fix-rounds pass).")
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +180,8 @@ text."""
 def generate(lecture_dir: Path, title: str | None, output_path: Path,
              references: list[dict] | None = None,
              backend: str = "subscription", model: str | None = None,
-             frame_model: str | None = None, wait: bool = False) -> None:
+             frame_model: str | None = None, wait: bool = False,
+             fix_rounds: int = 2) -> None:
     # Load transcript
     transcript_path = lecture_dir / "transcript.json"
     if not transcript_path.exists():
@@ -128,11 +201,14 @@ def generate(lecture_dir: Path, title: str | None, output_path: Path,
     if video_path is None:
         print("Warning: no video file found — get_frame tool will be unavailable.")
 
-    ctx = NotesToolContext(
-        refs_dir=lecture_dir / "references",
-        video_path=video_path,
-        total_duration=total_duration,
-    )
+    def make_ctx() -> NotesToolContext:
+        return NotesToolContext(
+            refs_dir=lecture_dir / "references",
+            video_path=video_path,
+            total_duration=total_duration,
+        )
+
+    ctx = make_ctx()
 
     refs_block = ""
     if references:
@@ -171,7 +247,8 @@ def generate(lecture_dir: Path, title: str | None, output_path: Path,
 
     print(f"\nDone. Frame requests: {ctx.frame_requests}")
     print(f"LaTeX saved to: {output_path}")
-    report_latex_check(output_path)
+    check_and_fix(output_path, make_ctx, backend, model, frame_model,
+                  fix_rounds)
 
 
 # ---------------------------------------------------------------------------
@@ -180,10 +257,12 @@ def generate(lecture_dir: Path, title: str | None, output_path: Path,
 
 def answer_followup(lecture_dir: Path, output_path: Path,
                     backend: str, model: str | None,
-                    frame_model: str | None, wait: bool = False) -> None:
+                    frame_model: str | None, wait: bool = False,
+                    fix_rounds: int = 2) -> None:
     if not output_path.exists():
         sys.exit(f"No notes file at {output_path} — generate the notes first.")
 
+    segments: list[dict] = []
     total_duration = 0.0
     transcript_path = lecture_dir / "transcript.json"
     if transcript_path.exists():
@@ -191,13 +270,16 @@ def answer_followup(lecture_dir: Path, output_path: Path,
             segments = json.load(f)["segments"]
         total_duration = segments[-1]["end"] if segments else 0.0
 
-    ctx = NotesToolContext(
-        refs_dir=lecture_dir / "references",
-        video_path=find_video(lecture_dir),
-        total_duration=total_duration,
-    )
+    def make_ctx() -> NotesToolContext:
+        return NotesToolContext(
+            refs_dir=lecture_dir / "references",
+            video_path=find_video(lecture_dir),
+            total_duration=total_duration,
+        )
 
-    answers_block = collect_followup_answers(ctx, output_path)
+    ctx = make_ctx()
+
+    answers_block = collect_followup_answers(ctx, output_path, segments)
     todos = count_todos(output_path.read_text())
     if not answers_block and todos == 0:
         print("No open questions and no \\todo markers — nothing to do.")
@@ -227,7 +309,8 @@ def answer_followup(lecture_dir: Path, output_path: Path,
         wait_for_answers=wait,
     )
     print(f"\nRevised: {output_path}")
-    report_latex_check(output_path)
+    check_and_fix(output_path, make_ctx, backend, model, frame_model,
+                  fix_rounds)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +352,10 @@ def main():
                              "an earlier run and have the agent revise the "
                              "existing notes (also sweeps remaining \\todo "
                              "markers).")
+    parser.add_argument("--latex-fix-rounds", type=int, default=2, metavar="N",
+                        help="When the notes fail to compile, hand the errors "
+                             "back to the model and re-check, up to N times "
+                             "(default: 2; 0 to only report errors).")
     args = parser.parse_args()
 
     lecture_dir = Path(args.lecture_dir).resolve()
@@ -280,7 +367,8 @@ def main():
 
     if args.answer:
         answer_followup(lecture_dir, output_path.resolve(), args.backend,
-                        args.model, args.frame_model, args.wait)
+                        args.model, args.frame_model, args.wait,
+                        args.latex_fix_rounds)
         return
 
     references = []
@@ -294,7 +382,8 @@ def main():
             print(f"  Warning: could not fetch {url_or_id}: {exc}")
 
     generate(lecture_dir, args.title, output_path, references,
-             args.backend, args.model, args.frame_model, args.wait)
+             args.backend, args.model, args.frame_model, args.wait,
+             args.latex_fix_rounds)
 
 
 if __name__ == "__main__":

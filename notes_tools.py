@@ -20,6 +20,7 @@ protocol channel and must stay clean. Interactive prompts fall back to
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -27,7 +28,8 @@ from pathlib import Path
 from typing import Callable
 
 from fetch import describe_assets, fetch_reference
-from media import extract_frame, extract_frame_file
+from media import (extract_frame, extract_frame_file, format_timestamp,
+                   parse_timestamp)
 
 
 @dataclass
@@ -81,6 +83,9 @@ class NotesToolContext:
     # root, so the agent can consult earlier lecture files). The
     # subscription/codex backends read files natively.
     read_roots: list = field(default_factory=list)
+    # When set, the cite_reference tool is offered and entries accumulate in
+    # this .bib file (course mode's running bibliography).
+    bib_file: Path | None = None
     # Populated during the run:
     new_corrections: dict = field(default_factory=dict)
     new_preamble_additions: list = field(default_factory=list)
@@ -104,6 +109,8 @@ class NotesToolContext:
             "state_file": str(self.state_file) if self.state_file else None,
             "frames_dir": str(self.frames_dir) if self.frames_dir else None,
             "question_seq": self.question_seq,
+            "bib_file": str(self.bib_file) if self.bib_file else None,
+            "read_roots": [str(r) for r in self.read_roots],
         }))
 
     @classmethod
@@ -118,6 +125,8 @@ class NotesToolContext:
             state_file=Path(d["state_file"]) if d["state_file"] else None,
             frames_dir=Path(d["frames_dir"]) if d.get("frames_dir") else None,
             question_seq=d.get("question_seq", 1),
+            bib_file=Path(d["bib_file"]) if d.get("bib_file") else None,
+            read_roots=[Path(r) for r in d.get("read_roots", [])],
         )
 
     def save_state(self) -> None:
@@ -210,10 +219,10 @@ class QuestionBroker:
         self._closed = False
 
     def ask(self, kind: str, text: str, context: str = "",
-            guess: str = "") -> dict:
+            guess: str = "", timestamp: str | None = None) -> dict:
         with self._lock:
             q = {"id": self.ctx.question_seq, "kind": kind, "text": text,
-                 "context": context, "guess": guess,
+                 "context": context, "guess": guess, "timestamp": timestamp,
                  "answer": None, "delivered": False}
             self.ctx.question_seq += 1
             self.ctx.questions.append(q)
@@ -276,8 +285,9 @@ class QuestionBroker:
     def _prompt_one(self, q: dict) -> bool:
         """Prompt for one question. Returns False if aborted by close()."""
         aborted = lambda: self._closed
+        at = f" @ {q['timestamp']}" if q.get("timestamp") else ""
         if q["kind"] == "clarify":
-            emit(f'\n  [Transcript unclear #{q["id"]}] "{q["text"]}"')
+            emit(f'\n  [Transcript unclear #{q["id"]}{at}] "{q["text"]}"')
             if q["context"]:
                 emit(f"  Context: {q['context']}")
             if q["guess"]:
@@ -299,7 +309,9 @@ class QuestionBroker:
                         self.ctx.new_corrections[q["text"]] = final
                 self.ctx.save_state()
         else:
-            emit(f"\n  [Question #{q['id']} for you] {q['text']}")
+            emit(f"\n  [Question #{q['id']}{at} for you] {q['text']}")
+            if q.get("guess"):
+                emit(f"  Provisionally using: {q['guess']}")
             ans = ask_user_input("  Your answer (Enter to defer): ",
                                  should_abort=aborted)
             if ans is None:
@@ -319,32 +331,109 @@ def ensure_broker(ctx: NotesToolContext) -> QuestionBroker:
     return broker
 
 
+_DEF_RE = re.compile(
+    r"\\(?:new|renew|provide)command\s*\*?\s*\{?\s*(\\[a-zA-Z@]+)\s*\}?"
+    r"|\\DeclareMathOperator\s*\*?\s*\{\s*(\\[a-zA-Z@]+)\s*\}"
+    r"|\\def\s*(\\[a-zA-Z@]+)")
+
+
+def macro_definitions(latex: str) -> dict[str, tuple[str, str]]:
+    """Macros defined by a preamble block: name -> (definition body, line).
+
+    The body is what follows the declaration, so \\newcommand{\\Q}{\\Q} and
+    \\providecommand{\\Q}{\\Q} compare equal — one lecture re-declaring
+    exactly what another already declared is harmless."""
+    out: dict[str, tuple[str, str]] = {}
+    for line in latex.splitlines():
+        m = _DEF_RE.search(line)
+        if not m:
+            continue
+        name = m.group(1) or m.group(2) or m.group(3)
+        out.setdefault(name, (line[m.end():].strip(), line.strip()))
+    return out
+
+
 def is_open(q: dict) -> bool:
     """A question that a follow-up run should (re-)ask the user."""
     return q["answer"] is None or bool(q.get("deferred"))
 
 
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def backfill_question_timestamps(questions: list[dict],
+                                 segments: list[dict]) -> int:
+    """Give timestamps to questions queued before timestamps were recorded.
+
+    A clarify question quotes the transcript verbatim, so its position can be
+    recovered exactly by locating that quote — no guessing. Matching is on a
+    normalized word stream (the quote may elide with '...' or differ in
+    punctuation), longest prefix first; a question that cannot be located is
+    left alone."""
+    todo = [q for q in questions if not q.get("timestamp") and q.get("text")]
+    if not todo or not segments:
+        return 0
+
+    stream: list[str] = []
+    starts: list[float] = []
+    for seg in segments:
+        for w in _words(seg.get("text", "")):
+            stream.append(w)
+            starts.append(seg["start"])
+
+    filled = 0
+    for q in todo:
+        target = _words(q["text"])
+        for n in range(min(8, len(target)), 2, -1):
+            probe = target[:n]
+            for i in range(len(stream) - n + 1):
+                if stream[i:i + n] == probe:
+                    q["timestamp"] = format_timestamp(starts[i])
+                    filled += 1
+                    break
+            else:
+                continue
+            break
+    return filled
+
+
 def format_answers(items: list[dict]) -> str:
-    """Render answered questions for delivery to the agent."""
+    """Render answered questions for delivery to the agent.
+
+    A follow-up run is a fresh context: the agent no longer remembers what it
+    asked or what it provisionally wrote, and only has this block plus the
+    \\todo marker to work from. So every answer restates the question and the
+    agent's own guess — without them a bare answer like "yes, the second one"
+    is unusable."""
     lines = []
     for q in items:
+        at = f" [{q['timestamp']}]" if q.get("timestamp") else ""
+        guess = q.get("guess") or ""
+        if q["kind"] == "clarify":
+            head = f"- Answer #{q['id']}{at} — transcript read \"{q['text']}\""
+            head += (f"; your guess was \"{guess}\"." if guess
+                     else " (you made no guess).")
+        else:
+            head = f"- Answer #{q['id']}{at} — you asked: \"{q['text']}\""
+            head += (f"; provisionally you used: {guess}." if guess else ".")
+        lines.append(head)
+
         if q.get("deferred"):
-            lines.append(f"- Answer #{q['id']}: deferred by the user — keep "
-                         f"your provisional version and its \\todo; a later "
-                         f"follow-up run may resolve it.")
+            lines.append("  DEFERRED by the user — keep your provisional "
+                         "version and its \\todo; a later follow-up run may "
+                         "resolve it.")
         elif q["kind"] == "clarify":
-            final = q["answer"] or q["guess"]
-            if final == q["guess"]:
-                lines.append(f"- Answer #{q['id']}: your guess CONFIRMED — "
-                             f"\"{q['text']}\" → \"{final}\". Remove the "
+            final = q["answer"] or guess
+            if final == guess:
+                lines.append(f"  CONFIRMED: it reads \"{final}\". Remove the "
                              f"matching \\todo.")
             else:
-                lines.append(f"- Answer #{q['id']}: CORRECTED — \"{q['text']}\" "
-                             f"should read \"{final}\" (your guess was "
-                             f"\"{q['guess']}\"). Fix the text and remove the "
+                lines.append(f"  CORRECTED: it should read \"{final}\", not "
+                             f"\"{guess}\". Fix the text and remove the "
                              f"matching \\todo.")
         else:
-            lines.append(f"- Answer #{q['id']}: {q['answer']}")
+            lines.append(f"  User's answer: {q['answer']}")
     return "\n".join(lines)
 
 
@@ -410,8 +499,17 @@ def build_tools(ctx: NotesToolContext) -> list[dict]:
                         "type": "string",
                         "description": "Your best guess at the correct word or phrase.",
                     },
+                    "timestamp": {
+                        "type": "string",
+                        "description": (
+                            "When this is said, as hh:mm:ss — copy the "
+                            "timestamp of the transcript line it comes from. "
+                            "The user uses it to jump to that point in the "
+                            "video, so it must be the real position."
+                        ),
+                    },
                 },
-                "required": ["transcript_text", "context"],
+                "required": ["transcript_text", "context", "timestamp"],
             },
         },
         {
@@ -435,9 +533,30 @@ def build_tools(ctx: NotesToolContext) -> list[dict]:
                             "'What LaTeX package and command should I use for "
                             "the prism symbol in prismatic cohomology?'"
                         ),
-                    }
+                    },
+                    "timestamp": {
+                        "type": "string",
+                        "description": (
+                            "The point in the lecture the question is about, "
+                            "as hh:mm:ss (from the transcript line, or the "
+                            "frame you were looking at). Supply it whenever "
+                            "the question comes from a specific moment — "
+                            "nearly always — so the user can go and look."
+                        ),
+                    },
+                    "provisional": {
+                        "type": "string",
+                        "description": (
+                            "What you are doing in the meantime, e.g. "
+                            "'\\square from amssymb'. This is handed back to "
+                            "you with the answer — by then you will be a "
+                            "fresh context that no longer remembers what you "
+                            "chose, and the user's reply may well be just "
+                            "'yes, that works'."
+                        ),
+                    },
                 },
-                "required": ["question"],
+                "required": ["question", "timestamp"],
             },
         },
         {
@@ -483,7 +602,10 @@ def build_tools(ctx: NotesToolContext) -> list[dict]:
                 "e.g. \\usepackage{bbm}, \\newcommand{\\Prism}{...}, "
                 "\\DeclareMathOperator{\\Tr}{Tr}, or \\declaretheorem{...}. "
                 "Call this before writing body content that depends on it. "
-                "Do not add hyperref or cleveref (already loaded last)."
+                "Do not add hyperref or cleveref (already loaded last). The "
+                "preamble is shared by every lecture in the course, so a "
+                "macro another lecture already defined cannot be redefined — "
+                "you will be told what it is already bound to."
             ),
             "input_schema": {
                 "type": "object",
@@ -498,6 +620,57 @@ def build_tools(ctx: NotesToolContext) -> list[dict]:
                     }
                 },
                 "required": ["latex"],
+            },
+        })
+
+    if ctx.bib_file:
+        tools.append({
+            "name": "cite_reference",
+            "description": (
+                "Add a paper, book, or web page to the course bibliography "
+                "and get back its cite key, for use as \\cite{key} in the "
+                "notes. For an arXiv ID/URL or DOI the full metadata is "
+                "fetched automatically — pass just the identifier. For "
+                "anything else (lecture notes, a book without a DOI, a web "
+                "page) ALSO pass title, author, and year: you almost always "
+                "know or can look them up, and without an author the entry "
+                "gets an ugly placeholder citation label instead of a proper "
+                "one like [Sch19]. Safe to call repeatedly for the same "
+                "source — it returns the existing key. Cite the sources the "
+                "lecturer names, and the references you consulted for "
+                "definitions or notation. Never hand-write bibliography "
+                "entries or \\printbibliography: the bibliography is "
+                "assembled for you."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url_or_id": {
+                        "type": "string",
+                        "description": ("arXiv ID (e.g. '1905.08229'), DOI, "
+                                        "or URL."),
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": ("Title. Needed only when metadata "
+                                        "cannot be fetched automatically "
+                                        "(i.e. not an arXiv paper or DOI)."),
+                    },
+                    "author": {
+                        "type": "string",
+                        "description": (
+                            "Author(s), BibTeX style: 'Peter Scholze' or "
+                            "'Dustin Clausen and Peter Scholze'. Supply this "
+                            "whenever the source is not an arXiv paper or "
+                            "DOI — check the document itself if unsure."),
+                    },
+                    "year": {
+                        "type": "string",
+                        "description": ("Publication year, e.g. '2019'. "
+                                        "Supply alongside author."),
+                    },
+                },
+                "required": ["url_or_id"],
             },
         })
 
@@ -522,11 +695,12 @@ def build_tools(ctx: NotesToolContext) -> list[dict]:
                 "type": "object",
                 "properties": {
                     "timestamp": {
-                        "type": "number",
+                        "type": ["number", "string"],
                         "description": (
-                            f"Seconds into the video (0 – {ctx.total_duration:.0f}). "
-                            "The transcript includes [MM:SS] markers — convert "
-                            "to seconds before passing here."
+                            f"Position in the video, from 00:00:00 to "
+                            f"{format_timestamp(ctx.total_duration)}. Either "
+                            f"hh:mm:ss — exactly as the transcript's [hh:mm:ss] "
+                            f"markers give it — or a number of seconds."
                         ),
                     }
                 },
@@ -563,6 +737,23 @@ def build_handlers(ctx: NotesToolContext) -> dict[str, Handler]:
                 f"{assets}\n{ref['text']}")
         except Exception as exc:
             return ToolResult(f"Error fetching document: {exc}", is_error=True)
+
+    def cite_reference(inp: dict) -> ToolResult:
+        from bibliography import cite
+        url_or_id = inp["url_or_id"]
+        try:
+            key, added = cite(Path(ctx.bib_file), url_or_id,
+                              inp.get("title") or None,
+                              inp.get("author") or None,
+                              inp.get("year") or None)
+        except Exception as exc:
+            return ToolResult(f"Error adding to bibliography: {exc}",
+                              is_error=True)
+        emit(f"  [cite {url_or_id} → \\cite{{{key}}}"
+             f"{'' if added else ', already present'}]")
+        return ToolResult(
+            f"{'Added to' if added else 'Already in'} the bibliography. "
+            f"Cite it as \\cite{{{key}}}.")
 
     def view_pdf_page(inp: dict) -> ToolResult:
         p = Path(inp["path"]).resolve()
@@ -601,23 +792,51 @@ def build_handlers(ctx: NotesToolContext) -> dict[str, Handler]:
                         "data": base64.b64encode(png).decode()}},
         ])
 
+    def _question_time(inp: dict) -> tuple[str | None, str]:
+        """Normalize the timestamp the model supplied. Returns (hh:mm:ss or
+        None, a note to append to the tool result)."""
+        raw = inp.get("timestamp")
+        if raw in (None, ""):
+            return None, (
+                " No timestamp was recorded, so the user has nothing to jump "
+                "to in the video — pass one (hh:mm:ss) next time.")
+        seconds = parse_timestamp(raw)
+        if seconds is None:
+            return None, (
+                f" Could not read the timestamp {raw!r}, so none was recorded"
+                f" — use hh:mm:ss.")
+        stamp = format_timestamp(seconds)
+        if ctx.total_duration and seconds > ctx.total_duration + 1:
+            return stamp, (
+                f" Note: {stamp} is past the end of this lecture "
+                f"({format_timestamp(ctx.total_duration)}) — check you used "
+                f"hh:mm:ss and not some other unit.")
+        return stamp, ""
+
+    def _marker(q: dict) -> str:
+        at = f" @ {q['timestamp']}" if q.get("timestamp") else ""
+        return f"\\todo{{awaiting answer #{q['id']}{at}}}"
+
     def clarify_transcript(inp: dict) -> ToolResult:
+        stamp, note = _question_time(inp)
         q = broker.ask("clarify", text=inp["transcript_text"],
                        context=inp.get("context", ""),
-                       guess=inp.get("guess", ""))
+                       guess=inp.get("guess", ""), timestamp=stamp)
         return ToolResult(
             f"Question #{q['id']} queued for the user; the answer arrives "
             f"asynchronously. Proceed with your best guess for now, mark the "
-            f"spot with \\todo{{awaiting answer #{q['id']}}}, and keep "
-            f"working. Call get_user_answers later to pick up the verdict.")
+            f"spot with {_marker(q)}, and keep working. Call get_user_answers "
+            f"later to pick up the verdict." + note)
 
     def ask_user(inp: dict) -> ToolResult:
-        q = broker.ask("ask_user", text=inp["question"])
+        stamp, note = _question_time(inp)
+        q = broker.ask("ask_user", text=inp["question"], timestamp=stamp,
+                       guess=inp.get("provisional", ""))
         return ToolResult(
             f"Question #{q['id']} queued for the user; the answer arrives "
             f"asynchronously. Proceed with your best provisional choice, mark "
-            f"the spot with \\todo{{awaiting answer #{q['id']}}}, and keep "
-            f"working. Call get_user_answers later to pick up the answer.")
+            f"the spot with {_marker(q)}, and keep working. Call "
+            f"get_user_answers later to pick up the answer." + note)
 
     def get_user_answers(inp: dict) -> ToolResult:
         items = broker.drain_new()
@@ -631,24 +850,84 @@ def build_handlers(ctx: NotesToolContext) -> dict[str, Handler]:
 
     def add_to_preamble(inp: dict) -> ToolResult:
         latex = inp["latex"].strip()
-        if (latex not in ctx.existing_preamble
-                and latex not in ctx.new_preamble_additions):
-            ctx.new_preamble_additions.append(latex)
-            ctx.save_state()
-            emit(f"    [preamble] {latex[:60]}{'…' if len(latex) > 60 else ''}")
-        return ToolResult("Added to preamble.")
+        if not latex:
+            return ToolResult("Nothing to add.")
+        if (latex in ctx.existing_preamble
+                or latex in ctx.new_preamble_additions):
+            return ToolResult("Already in the preamble.")
+
+        # The preamble is shared across the whole course, so a macro this
+        # lecture defines may already have been defined by another one.
+        # Redefining it with \newcommand breaks the build; redefining it with
+        # \providecommand silently keeps the *old* meaning, which is worse —
+        # the notes then render with notation the lecture never intended.
+        defined = {}
+        for block in list(ctx.existing_preamble) + list(
+                ctx.new_preamble_additions):
+            for name, (body, line) in macro_definitions(block).items():
+                defined.setdefault(name, (body, line))
+
+        kept, clashes, superseded = [], [], []
+        for line in latex.splitlines():
+            defs = macro_definitions(line)
+            if not defs:
+                kept.append(line)
+                continue
+            name, (body, _) = next(iter(defs.items()))
+            prior = defined.get(name)
+            if prior is None:
+                kept.append(line)
+                defined[name] = (body, line.strip())
+            elif prior[0] == body:
+                continue          # same definition, already there
+            elif line.lstrip().startswith("\\providecommand"):
+                superseded.append((name, prior[1]))
+            else:
+                clashes.append((name, prior[1], line.strip()))
+
+        if clashes:
+            detail = "\n".join(
+                f"  {n} is already defined as: {old}\n"
+                f"    your version: {new}" for n, old, new in clashes)
+            return ToolResult(
+                "Nothing was added — these macros are already defined in the "
+                "shared course preamble with a different meaning, and "
+                "redefining them would break the build:\n" + detail +
+                "\nUse the existing definition, or pick a different name for "
+                "yours.", is_error=True)
+
+        note = ""
+        if superseded:
+            note = "\n" + "\n".join(
+                f"Note: {n} already exists as `{old}` — your "
+                f"\\providecommand did not take effect, so it will render "
+                f"with the existing meaning. Use a different name if you "
+                f"need different notation." for n, old in superseded)
+
+        block = "\n".join(kept).strip()
+        if not block:
+            return ToolResult("Nothing new to add." + note)
+        ctx.new_preamble_additions.append(block)
+        ctx.save_state()
+        emit(f"    [preamble] {block[:60]}{'…' if len(block) > 60 else ''}")
+        return ToolResult("Added to preamble." + note)
 
     def get_frame(inp: dict) -> ToolResult:
-        ts = float(inp["timestamp"])
+        ts = parse_timestamp(inp["timestamp"])
+        if ts is None:
+            return ToolResult(
+                f"Error: could not read the timestamp "
+                f"{inp['timestamp']!r} — use hh:mm:ss or a number of seconds.",
+                is_error=True)
         ctx.frame_requests += 1
         ctx.save_state()
-        emit(f"  [get_frame @ {ts:.1f}s]")
+        emit(f"  [get_frame @ {format_timestamp(ts)}]")
         if ctx.frames_dir:
             path = extract_frame_file(ctx.video_path, ts, ctx.frames_dir)
             if path:
                 return ToolResult(
-                    f"Saved the frame at {ts:.1f}s to {path}. Open it with "
-                    f"your image-viewing tool to inspect it.")
+                    f"Saved the frame at {format_timestamp(ts)} to {path}. "
+                    f"Open it with your image-viewing tool to inspect it.")
         else:
             b64 = extract_frame(ctx.video_path, ts)
             if b64:
@@ -670,6 +949,8 @@ def build_handlers(ctx: NotesToolContext) -> dict[str, Handler]:
         "ask_user": ask_user,
         "get_user_answers": get_user_answers,
     }
+    if ctx.bib_file:
+        handlers["cite_reference"] = cite_reference
     if ctx.enable_preamble:
         handlers["add_to_preamble"] = add_to_preamble
     if ctx.video_path:

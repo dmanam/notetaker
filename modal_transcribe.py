@@ -12,10 +12,12 @@ Transcription is a parameterized class so that:
     max_containers) — wall-clock for a series approaches that of one lecture.
 
 Entry points (methods on Transcriber):
-  from_bytes(audio_bytes)  — audio uploaded from the local machine (FLAC/WAV)
+  from_bytes(audio_bytes)  — audio uploaded from the local machine (FLAC/WAV;
+                             the default path)
   from_url(source_url)     — the worker downloads the audio itself with
-                             yt-dlp (used for remote videos, so a slow local
-                             uplink never has to upload the audio)
+                             yt-dlp (opt-in via --modal-fetch: YouTube tends
+                             to block datacenter egress, but when it works, a
+                             slow local uplink never has to upload the audio)
 
 Model weights are cached in a persistent Modal volume, so only the first run
 of a given model size pays the download.
@@ -35,6 +37,51 @@ image = (
 
 cache_volume = modal.Volume.from_name("notetaker-whisper-cache",
                                       create_if_missing=True)
+
+
+# ---------------------------------------------------------------------------
+# CPU-only helpers: route yt-dlp traffic through Modal's egress (circumvents
+# rate limiting of the local IP). Used with --download modal.
+# ---------------------------------------------------------------------------
+
+@app.function(image=image, timeout=60 * 60)
+def download_media(source_url: str) -> dict:
+    """Download a video with yt-dlp on the worker and return it as bytes.
+    Returns {"filename": str, "video": bytes, "info": dict}."""
+    import json
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        subprocess.run(
+            ["yt-dlp", "--no-playlist", "--write-info-json",
+             "--output", f"{td}/video.%(ext)s", source_url],
+            check=True,
+        )
+        tdp = Path(td)
+        info_path = tdp / "video.info.json"
+        info = json.loads(info_path.read_text()) if info_path.exists() else {}
+        videos = [p for p in tdp.glob("video.*")
+                  if p.suffix.lower() != ".json"]
+        if not videos:
+            raise RuntimeError("yt-dlp ran but produced no video file")
+        return {"filename": videos[0].name,
+                "video": videos[0].read_bytes(),
+                "info": info}
+
+
+@app.function(image=image, timeout=10 * 60)
+def probe_playlist(source_url: str) -> dict:
+    """yt-dlp --flat-playlist -J on the worker; returns the parsed JSON."""
+    import json
+    import subprocess
+
+    result = subprocess.run(
+        ["yt-dlp", "--flat-playlist", "-J", source_url],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(result.stdout)
 
 
 @app.cls(

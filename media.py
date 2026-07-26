@@ -15,13 +15,48 @@ from pathlib import Path
 VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".m4v")
 
 
+def format_timestamp(seconds: float | int) -> str:
+    """Seconds → hh:mm:ss. One format everywhere — transcript lines, queued
+    questions, \\todo markers — so any timestamp the user sees can be typed
+    straight into a video player."""
+    total = max(0, int(round(float(seconds))))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def parse_timestamp(value: float | int | str | None) -> float | None:
+    """Seconds from whatever a model supplies: 754, "754", "12:34",
+    "00:12:34", "[00:12:34]". None if it is not a time at all."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().strip("[]").strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    if len(parts) > 3:
+        return None
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        return None
+    total = 0.0
+    for n in nums:            # ss | mm:ss | hh:mm:ss
+        total = total * 60 + n
+    return total
+
+
+def normalize_timestamp(value: float | int | str | None) -> str | None:
+    """Any accepted timestamp form → hh:mm:ss (None if unparseable)."""
+    seconds = parse_timestamp(value)
+    return None if seconds is None else format_timestamp(seconds)
+
+
 def format_transcript(segments: list[dict]) -> str:
-    lines = []
-    for seg in segments:
-        t = seg["start"]
-        m, s = divmod(int(t), 60)
-        lines.append(f"[{m:02d}:{s:02d}] {seg['text']}")
-    return "\n".join(lines)
+    return "\n".join(f"[{format_timestamp(seg['start'])}] {seg['text']}"
+                     for seg in segments)
 
 
 def _ffmpeg_frame(video_path: Path, timestamp: float, out_path: str) -> bool:
