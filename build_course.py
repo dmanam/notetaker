@@ -40,8 +40,8 @@ Options:
   --frame-model MODEL   Cheaper model that reads video frames for the main
                         model (default: haiku on the Claude backends)
   --answer SLUG         Answer questions left open by an earlier run of
-                        lecture SLUG, and its \todo markers, then revise that
-                        section in place. Answering a \todo is optional —
+                        lecture SLUG, and its \\todo markers, then revise that
+                        section in place. Answering a \\todo is optional —
                         press Enter to leave it for the model to sweep
   --answer-all          Same, for every lecture with open questions or todos
   --latex-fix-rounds N  Rounds of model-driven repair when the assembled

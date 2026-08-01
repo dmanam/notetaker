@@ -7,7 +7,8 @@ for t in tests/test_*.py; do python "$t" || echo "FAILED $t"; done
 ```
 
 Each file is a script of assertions with a printed line per property checked.
-They need the dev shell (`nix develop`) for ffmpeg, pdflatex and numpy, and
+They need ffmpeg, pdflatex and numpy on `PATH` (`nix develop` supplies all
+three if you use the flake), and
 they build their own fixtures in a temp directory — none of them touch
 `output/`.
 
