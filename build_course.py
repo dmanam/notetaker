@@ -71,7 +71,11 @@ from style_extract import extract as extract_style
 from boards import analyse
 from lecturer import (ATTRIBUTION_INSTRUCTION, lecturer_note,
                       resolve as resolve_lecturers)
-from latex_check import LatexError, check_latex, print_errors, tokens_of
+from equations import (ReviewItem, dangling_references, defined_labels,
+                       normalize_equation_numbering, referenced_labels,
+                       review_items)
+from latex_check import (LatexError, check_latex, compile_document,
+                         print_errors, print_warnings, tokens_of)
 from media import find_video, format_timestamp, format_transcript
 from notes_tools import (NotesToolContext, REGISTER_INSTRUCTION,
                          ask_user_input, style_exemplar_block)
@@ -106,24 +110,42 @@ PREAMBLE_TEMPLATE = r"""\documentclass[11pt]{article}
   pdfusetitle,
 ]{hyperref}
 %% cleveref last — produces "Theorem 2.3", "Definition 1.4", etc. automatically
-\usepackage[nameinlink,noabbrev]{cleveref}
+\usepackage[nameinlink,noabbrev,capitalise]{cleveref}
 %(bibliography)s
+
+%% Make equation and figure numbering per-section
+\numberwithin{equation}{section}
+\numberwithin{figure}{section}
 
 %% Theorem environments via thmtools (\declaretheorem registers names with cleveref)
 \declaretheorem[numberwithin=section,style=plain]{theorem}
 \declaretheorem[sibling=theorem,style=plain]{lemma}
 \declaretheorem[sibling=theorem,style=plain]{proposition}
 \declaretheorem[sibling=theorem,style=plain]{corollary}
+\declaretheorem[sibling=theorem,style=plain]{claim}
 \declaretheorem[sibling=theorem,style=definition]{definition}
+\declaretheorem[sibling=theorem,style=definition]{construction}
 \declaretheorem[sibling=theorem,style=definition]{example}
 \declaretheorem[sibling=theorem,style=definition]{exercise}
 \declaretheorem[sibling=theorem,style=remark]{remark}
 \declaretheorem[sibling=theorem,style=remark]{notation}
+\declaretheorem[sibling=theorem,style=remark]{recollection}
+\declaretheorem[sibling=theorem,style=remark]{goal}
+\declaretheorem[sibling=theorem,style=remark]{question}
 %% Theorem environments Claude asked for. These land after the built-in ones
 %% because they routinely say sibling=theorem or numberlike=theorem, and
 %% thmtools resolves that at declaration time — declared earlier they fail
 %% with "No counter 'theorem' defined".
 %(extra_theorems)s
+
+%% \theH<env> is the anchor hyperref uses, and it defaults to the bare counter
+%% with no section in it — so Theorem 1.1 and Theorem 2.1 both anchor at
+%% "theorem.1", hyperref drops the duplicate, and every link to either lands on
+%% whichever came first. Putting \theHsection in front makes each anchor
+%% unique. Must come after every \declaretheorem above.
+\renewcommand{\theHequation}{\theHsection.\arabic{equation}}
+\renewcommand{\theHfigure}{\theHsection.\arabic{figure}}
+%(theorem_anchors)s
 
 \title{%(title)s}
 \date{}
@@ -1143,10 +1165,15 @@ def course_preamble(title: str, state: dict,
     build and the multi-file export so the two cannot drift apart."""
     bib_preamble = BIB_PREAMBLE % BIB_FILENAME if with_bib else ""
     early, late = split_preamble(state.get("preamble_additions", []))
+    # Both of these are enforced here rather than asked for in the prompt:
+    # they are mechanically decidable, so a model that forgets one should not
+    # be able to produce a document that is wrong.
+    late = drop_duplicate_theorems(normalize_theorem_decls(late))
     preamble = PREAMBLE_TEMPLATE % {
         "title": title,
         "extra_preamble": "\n".join(early),
         "extra_theorems": "\n".join(late),
+        "theorem_anchors": theorem_anchor_block(late),
         "bibliography": bib_preamble,
     }
     return preamble, ("\n\n" + BIB_PRINT if with_bib else "")
@@ -1154,6 +1181,129 @@ def course_preamble(title: str, state: dict,
 
 _LATE_PREAMBLE = re.compile(r"^\s*\\(?:declaretheorem|theoremstyle"
                             r"|newtheorem|Crefname|crefname)\b")
+
+# \declaretheorem[opts]{name} and \newtheorem{name}[shared]{Title}[within]
+_DECLARETHEOREM = re.compile(r"(\\declaretheorem\s*)(?:\[([^\]]*)\])?\s*\{(\w+\*?)\}")
+_NEWTHEOREM = re.compile(r"(\\newtheorem\s*)\{(\w+\*?)\}\s*(?:\[(\w+)\])?\s*"
+                         r"\{([^{}]*)\}\s*(?:\[(\w+)\])?")
+
+# thmtools keys that decide which counter an environment uses. Any of them
+# means "number this independently or off something else"; all are replaced by
+# sibling=theorem so the whole document shares one sequence.
+_NUMBERING_KEYS = ("sibling", "numberlike", "numberwithin", "parent",
+                   "within")
+
+BASE_THEOREM = "theorem"
+
+
+def _strip_numbering(opts: str) -> list[str]:
+    """The thmtools options with every counter-choosing key removed."""
+    kept = []
+    for opt in opts.split(","):
+        opt = opt.strip()
+        if not opt:
+            continue
+        key = opt.split("=", 1)[0].strip()
+        if key not in _NUMBERING_KEYS:
+            kept.append(opt)
+    return kept
+
+
+def normalize_theorem_decls(lines: list[str]) -> list[str]:
+    """Put every model-declared theorem environment on the shared counter.
+
+    The built-in environments all say sibling=theorem, so Theorem 1.1 is
+    followed by Lemma 1.2 and Definition 1.3 — one sequence a reader can
+    scan. An environment the model declares without it starts its own
+    sequence, so the document then has two Claim 1.1s and no way to tell
+    which "1.1" a \\cref means. An unnumbered environment has no counter at
+    all and cannot be a sibling, so it is left alone.
+    """
+    out = []
+    for line in lines:
+        def fix_declare(m):
+            name, opts = m.group(3), m.group(2) or ""
+            if name == BASE_THEOREM or "unnumbered" in opts:
+                return m.group(0)
+            kept = _strip_numbering(opts) + [f"sibling={BASE_THEOREM}"]
+            return f"{m.group(1)}[{','.join(kept)}]{{{name}}}"
+
+        def fix_newtheorem(m):
+            head, name, shared, title, within = m.groups()
+            if name == BASE_THEOREM:
+                return m.group(0)
+            # [shared] and the trailing [within] are mutually exclusive in
+            # LaTeX; forcing the shared form drops the trailing one.
+            return f"{head}{{{name}}}[{BASE_THEOREM}]{{{title}}}"
+
+        line = _DECLARETHEOREM.sub(fix_declare, line)
+        line = _NEWTHEOREM.sub(fix_newtheorem, line)
+        out.append(line)
+    return out
+
+
+def declared_names(source: str) -> list[str]:
+    """Theorem environment names declared in a chunk of preamble, either way
+    round (\\declaretheorem or \\newtheorem)."""
+    names = []
+    for pattern, group in ((_DECLARETHEOREM, 3), (_NEWTHEOREM, 2)):
+        for m in pattern.finditer(source):
+            name = m.group(group).rstrip("*")
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def drop_duplicate_theorems(late: list[str]) -> list[str]:
+    """Remove declarations of an environment that already exists.
+
+    Re-declaring one is a hard error ("Command \\c@claim already defined")
+    that takes the whole document down, and there are two easy ways to get
+    there: the model declares the same environment while writing two
+    different lectures, or an environment it used to have to declare is later
+    promoted into the fixed template. Both are decidable here, so neither
+    should be able to reach a compile.
+    """
+    seen = set(declared_names(PREAMBLE_TEMPLATE))
+    kept = []
+    for line in late:
+        names = declared_names(line)
+        if names and all(n in seen for n in names):
+            continue
+        seen.update(names)
+        kept.append(line)
+    return kept
+
+
+def theorem_env_names(late: list[str]) -> list[str]:
+    """Every environment declared with \\declaretheorem: the built-in ones
+    plus whatever the model added, in declaration order, without repeats.
+
+    \\newtheorem environments are deliberately absent — hyperref hooks
+    \\newtheorem itself and gives those a working \\theH already.
+    """
+    names = []
+    for source in (PREAMBLE_TEMPLATE, "\n".join(late)):
+        for m in _DECLARETHEOREM.finditer(source):
+            name = m.group(3).rstrip("*")
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def theorem_anchor_block(late: list[str]) -> str:
+    """\\theH redefinitions that put the section into every theorem anchor.
+
+    \\theHtheorem defaults to the bare counter, with no section in it, so
+    Theorem 1.1 and Theorem 2.1 both anchor at "theorem.1" — hyperref drops
+    the duplicate and every link to either one lands on whichever came first.
+    Adding \\theHsection makes the anchor unique; pointing the siblings at
+    \\theHtheorem keeps them consistent with it, since they share the counter.
+    """
+    lines = [r"\renewcommand{\theHtheorem}{\theHsection.\arabic{theorem}}"]
+    lines += [f"\\renewcommand{{\\theH{name}}}{{\\theH{BASE_THEOREM}}}"
+              for name in theorem_env_names(late) if name != BASE_THEOREM]
+    return "\n".join(lines)
 
 
 def split_preamble(additions: list) -> tuple[list, list]:
@@ -1287,10 +1437,61 @@ def ordered_slugs(state: dict) -> list[str]:
                   key=lambda s: state["sections"][s]["lecture_num"])
 
 
+def normalize_equations(output_root: Path, state: dict,
+                        slugs: list[str]) -> list[ReviewItem]:
+    """Unnumber every display nothing cites, and report the ones a person has
+    to settle. Returns the review items.
+
+    Course-wide by construction: the referenced set is gathered from every
+    section before any section is rewritten, because lecture 9 routinely cites
+    an equation from lecture 3 and a per-section view would unnumber exactly
+    the equations that carry the course.
+    """
+    bodies = {slug: current_body(output_root, state, slug) for slug in slugs}
+    whole = "\n".join(bodies.values())
+    referenced = referenced_labels(whole)
+    defined = defined_labels(whole)
+
+    starred = numbered = 0
+    for slug, body in bodies.items():
+        new_body, off, on = normalize_equation_numbering(body, referenced)
+        if not (off or on):
+            continue
+        starred += off
+        numbered += on
+        state["sections"][slug]["body"] = new_body.strip()
+        section_file = output_root / slug / "section.tex"
+        if section_file.exists():
+            section_file.write_text(new_body)
+        bodies[slug] = new_body
+    if starred or numbered:
+        bits = []
+        if starred:
+            bits.append(f"{starred} uncited display(s) unnumbered")
+        if numbered:
+            bits.append(f"{numbered} newly cited display(s) numbered")
+        print("Equation numbering: " + ", ".join(bits) + ".")
+
+    items = []
+    for slug, body in bodies.items():
+        for item in review_items(body, referenced):
+            items.append((state["sections"][slug]["lecture_num"], slug, item))
+    items += [(0, "", d) for d in
+              dangling_references("\n".join(bodies.values()), defined)]
+    if items:
+        print(f"\nEquation numbering needs a reviewer ({len(items)} item(s)) "
+              f"— referenced displays that cannot produce a number:")
+        for num, slug, item in sorted(items, key=lambda r: (r[0], r[2].label)):
+            where = f"Lecture {num}" if num else "course-wide"
+            print(f"  {where}: {item}")
+    return [item for _, _, item in items]
+
+
 def write_document(output_root: Path, state: dict, output_tex: Path,
                    slugs: list[str], title: str | None = None
                    ) -> tuple[str, list[tuple[int, int]]]:
     """Assemble and write the course document. Returns (text, line spans)."""
+    normalize_equations(output_root, state, slugs)
     body_parts = [current_body(output_root, state, s) for s in slugs]
     output_tex.parent.mkdir(parents=True, exist_ok=True)
     doc, spans = render_document(title or state.get("title") or "Lecture Notes",
@@ -1470,10 +1671,38 @@ def double_script_note(errors: list[LatexError]) -> str:
         "Only brace the call site if the definition is genuinely fine.\n")
 
 
+POLISH_INSTRUCTION = """
+Fix each one in the file, and change nothing else. The mathematics is
+finished — you are adjusting how it is set, not what it says.
+
+Overfull \\hbox — something is wider than the text block and is printing into
+the margin. The usual causes, in the order they are usually the answer:
+- A long display that is really one line: break it with \\begin{align} or
+  \\begin{multline}, or insert \\allowbreak / \\quad at a natural point.
+- An inline formula too long to break: move it into a display.
+- A long \\texttt, URL or unhyphenatable word: allow a break (\\allowbreak,
+  \\-, or \\sloppy for that paragraph only).
+- A wide tabular, tikzcd or array: shrink the column spacing (@{}, \\arraycolsep,
+  column sep=small) or wrap it in \\resizebox{\\textwidth}{!}{...}.
+Do not fix one by deleting content, and do not wrap the whole file in
+\\sloppy — that trades a visible overflow for ugly inter-word spacing
+everywhere.
+
+"Token not allowed in a PDF string" — a \\section, \\subsection or caption
+contains maths, and hyperref cannot put maths in a PDF bookmark. Wrap the
+mathematical part in \\texorpdfstring{<the maths>}{<a plain-text version>},
+e.g. \\section{The \\texorpdfstring{$p$-adic}{p-adic} case}. The second
+argument is read by a PDF reader's bookmark pane, so it must be plain text:
+no macros, no $, no backslashes. Spell the symbol out when there is no ASCII
+for it (\\texorpdfstring{$\\mathbb{Z}_\\ell$}{Z_l}).
+"""
+
+
 def _fix_section(output_root: Path, state: dict, slug: str,
                  errors: list[LatexError], span: tuple[int, int],
                  doc_lines: list[str], backend: str, model: str | None,
-                 frame_model: str | None, run_usage: Usage) -> None:
+                 frame_model: str | None, run_usage: Usage,
+                 polish: bool = False) -> None:
     lecture_dir = output_root / slug
     section_file = ensure_section_file(output_root, state, slug)
     num = state["sections"][slug]["lecture_num"]
@@ -1497,21 +1726,29 @@ def _fix_section(output_root: Path, state: dict, slug: str,
             "year for anything that is not an arXiv ID or DOI) and use the "
             "key it returns.\n")
     script_note = double_script_note(errors)
-    user_text = (
-        f"The assembled course document does not compile. These errors come "
-        f"from your section, Lecture {num}, in `{section_file}`:\n\n"
-        f"{_localize(errors, span, doc_lines)}\n"
-        f"{cite_note}"
-        f"{script_note}\n"
-        f"{bibliography_index(output_root / BIB_FILENAME) if any(e.citations for e in errors) else ''}"
-        f"Read the file and fix them. Keep the mathematics exactly as it is — "
-        f"you are correcting LaTeX, not rewriting content. Note that the "
-        f"preamble is fixed and shared: if a macro or environment is genuinely "
-        f"missing, define it with add_to_preamble rather than working around "
-        f"it, and remember that the packages listed in your instructions are "
-        f"already loaded. Edit the file in place.")
-    print(f"\n[latex-fix → Lecture {num} ({slug})] {len(errors)} error(s)",
-          flush=True)
+    if polish:
+        user_text = (
+            f"The course document compiles, but these presentation problems "
+            f"come from your section, Lecture {num}, in `{section_file}`:\n\n"
+            f"{_localize(errors, span, doc_lines)}\n"
+            + POLISH_INSTRUCTION)
+    else:
+        user_text = (
+            f"The assembled course document does not compile. These errors "
+            f"come from your section, Lecture {num}, in `{section_file}`:\n\n"
+            f"{_localize(errors, span, doc_lines)}\n"
+            f"{cite_note}"
+            f"{script_note}\n"
+            f"{bibliography_index(output_root / BIB_FILENAME) if any(e.citations for e in errors) else ''}"
+            f"Read the file and fix them. Keep the mathematics exactly as it "
+            f"is — you are correcting LaTeX, not rewriting content. Note that "
+            f"the preamble is fixed and shared: if a macro or environment is "
+            f"genuinely missing, define it with add_to_preamble rather than "
+            f"working around it, and remember that the packages listed in "
+            f"your instructions are already loaded. Edit the file in place.")
+    print(f"\n[latex-{'polish' if polish else 'fix'} → Lecture {num} "
+          f"({slug})] {len(errors)} "
+          f"{'item' if polish else 'error'}(s)", flush=True)
     # No summary_file: this pass corrects LaTeX, it does not change what the
     # lecture says, so the existing summary stays valid.
     body = run_agent(system_prompt=SYSTEM_PROMPT, user_text=user_text, ctx=ctx,
@@ -1546,29 +1783,40 @@ def assemble_from_state(output_root: Path, state: dict, output_tex: Path,
     doc, spans = write_document(output_root, state, output_tex, slugs, title)
 
     for attempt in range(fix_rounds + 1):
-        errors = check_latex(output_tex)
+        errors, warnings = compile_document(output_tex)
         if errors is None:
             print("(no LaTeX toolchain found on PATH — skipping compile check)")
             return
-        if not errors:
+        if not errors and not warnings:
             print(f"Compile check OK: {output_tex.name}")
             return
-        print_errors(output_tex, errors)
+        # Correctness before appearance. While the document does not compile,
+        # TeX stops early and reflows nothing after the failure, so the line
+        # numbers on an overfull box are measured against a layout that will
+        # not exist once the errors are gone.
+        polish = not errors
+        items = warnings if polish else errors
+        if polish:
+            print_warnings(output_tex, warnings)
+        else:
+            print_errors(output_tex, errors)
         if attempt == fix_rounds:
             break
 
         doc_lines = doc.splitlines()
-        by_slug, unattributed = attribute_errors(errors, doc, spans, slugs,
+        by_slug, unattributed = attribute_errors(items, doc, spans, slugs,
                                                  state, output_root)
+        noun = "polish item" if polish else "error"
         if not by_slug:
-            print("  (could not attribute these errors to a lecture — "
+            print(f"  (could not attribute these {noun}s to a lecture — "
                   "leaving them for a manual pass)")
             break
         if unattributed:
-            print(f"  ({len(unattributed)} error(s) not attributable to a "
+            print(f"  ({len(unattributed)} {noun}(s) not attributable to a "
                   f"single lecture — not sent for repair)")
-        print(f"\nFixing (round {attempt + 1}/{fix_rounds}): "
-              f"{len(errors) - len(unattributed)} error(s) across "
+        print(f"\n{'Polishing' if polish else 'Fixing'} "
+              f"(round {attempt + 1}/{fix_rounds}): "
+              f"{len(items) - len(unattributed)} {noun}(s) across "
               f"{len(by_slug)} source(s).")
         if PREAMBLE_SLUG in by_slug:
             _fix_preamble(output_root, state, by_slug.pop(PREAMBLE_SLUG),
@@ -1578,11 +1826,11 @@ def assemble_from_state(output_root: Path, state: dict, output_tex: Path,
                             key=lambda s: state["sections"][s]["lecture_num"]):
             _fix_section(output_root, state, slug_, by_slug[slug_],
                          span_of[slug_], doc_lines, backend, model,
-                         frame_model, run_usage)
+                         frame_model, run_usage, polish=polish)
         doc, spans = write_document(output_root, state, output_tex, slugs,
                                     title)
 
-    print("  Remaining errors need a manual look "
+    print("  Remaining items need a manual look "
           "(or another --latex-fix-rounds pass).")
 
 
