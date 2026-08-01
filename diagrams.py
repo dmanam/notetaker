@@ -19,10 +19,9 @@ The loop it supports is:
                   no ghostscript, no ImageMagick)
     main model  — compares its render against the crop and fixes what differs
 
-The division of labour was measured, not assumed: the cheap model drew this
-diagram three times with the arrows reversed, including once after twenty-four
-magnified looks at the board. Locating a region it can do; reading an
-arrowhead it cannot.
+The division of labour is not an assumption. A cheap model will draw the same
+diagram with its arrows reversed however many magnified looks at the board it
+is given. Locating a region it can do; reading an arrowhead it cannot.
 
 Two things are deliberate. The snippet is compiled *alone*, so a broken
 diagram is caught here rather than taking the whole course build down with

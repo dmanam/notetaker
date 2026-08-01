@@ -120,12 +120,12 @@ assert (r"S_\infty", "S") in pairs and (r"S_\infty", r"\{\infty\}") in pairs
 assert D.lint(PUSHOUT) == [], D.lint(PUSHOUT)
 print("phantom corner marks are not counted as maps")
 
-# --- the compile gate must see the course's own macros ----------------------
-# It did not, and the cost was measured over eleven lectures: the notes define
-# \Nb, \utri, \Zhat (the agent is instructed to), a diagram written with them
-# failed to compile in the gate, and -file-line-error meant the failure parsed
-# to zero errors — so the agent was told "pdflatex failed." with no detail. It
-# spent its attempts blind and then wrote prose instead of the diagram.
+# --- the compile gate must see the notes' own macros ------------------------
+# It did not, and the cost was real: the notes define macros of their own (the
+# agent is instructed to), a diagram written with them failed to compile in
+# the gate, and -file-line-error meant the failure parsed to zero errors — so
+# the agent was told "pdflatex failed." with no detail. It spent its attempts
+# blind and then wrote prose instead of the diagram.
 import tempfile as _tf
 from pathlib import Path as _P
 import diagrams as _D

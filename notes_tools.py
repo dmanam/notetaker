@@ -1353,13 +1353,13 @@ def build_handlers(ctx: NotesToolContext) -> dict[str, Handler]:
         workdir = root / f"{slug or 'diagram'}-{n:02d}"
         emit(f"  [check_diagram {workdir.name}]")
 
-        # The course preamble has to go in. The notes define \Nb, \utri,
-        # \Zhat and the rest, and the agent is told to; a diagram written
+        # The course preamble has to go in. The notes define macros of their
+        # own, and the agent is told to; a diagram written
         # with them is correct in the document and fails here without them —
         # "Undefined control sequence" for a macro that is in fact defined.
-        # Measured cost of omitting it: the gate rejected valid diagrams,
-        # reported no parsed errors at all, and the agent either inlined every
-        # macro by hand or gave up and wrote prose instead of the diagram.
+        # The cost of omitting it: the gate rejects valid diagrams,
+        # reports no parsed errors at all, and the agent either inlines every
+        # macro by hand or gives up and writes prose instead of the diagram.
         # Includes what was added during this run, since the agent may have
         # declared a macro moments ago and used it here.
         preamble = "\n".join(list(ctx.existing_preamble)

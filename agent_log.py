@@ -7,7 +7,7 @@ Two files per run of the pipeline:
   output/logs/<ts>-<role>-<slug>.jsonl the full event trace for that one agent
 
 The index answers "which agents ran, what did they cost, which ones flailed";
-the per-agent trace answers "what exactly did the verifier do to lecture 12".
+the per-agent trace answers "what exactly did the verifier do to this lecture".
 Both are JSON Lines, so they can be read with a text editor or aggregated with
 a couple of lines of Python.
 

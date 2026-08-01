@@ -34,10 +34,16 @@ import json
 import sys
 from pathlib import Path
 
+from bibliography import BIB_FILENAME, attach_to_document
 from claude_backend import (BACKENDS, collect_followup_answers, count_todos,
                             mark_answers_applied, run_agent)
 from latex_check import check_latex, print_errors
 from fetch import describe_assets, fetch_reference
+from instructions import (ASK_USER_RULE, ASR_INSTRUCTION, CLARIFY_RULE,
+                          CROSSREF_RULE, DISFLUENCY_RULE, DISPLAY_RULES,
+                          FIDELITY_INSTRUCTION, FRAMES_RULE,
+                          HOUSE_STYLE_INSTRUCTION, MACRO_BRACING_RULE,
+                          TODO_RULE, cite_rule, diagram_rules)
 from media import find_video, format_transcript
 from notes_tools import (NotesToolContext, REGISTER_INSTRUCTION,
                          style_exemplar_block)
@@ -48,80 +54,49 @@ from lecturer import (ATTRIBUTION_INSTRUCTION, lecturer_note,
 # System prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = r"""You are an expert mathematical note-taker. Your task is to convert
+SYSTEM_PROMPT = (r"""You are an expert mathematical note-taker. Your task is to convert
 a raw lecture transcript into polished, well-structured LaTeX lecture notes in the
 style of Stanford/Berkeley graduate math course notes (e.g. the style at
 https://math.berkeley.edu/~fengt/stanford_course.html).
 
-The transcript was produced by automatic speech recognition and may contain errors:
-misheared words, mangled technical terms, or nonsensical phrases where the speaker
-said something the recogniser could not handle. Treat the transcript as a rough guide,
-not a verbatim record. If a passage does not make mathematical sense, it is likely a
-transcription error — use the clarify_transcript tool rather than reproducing the
-garbled text.
+""" + ASR_INSTRUCTION + "\n\n" + FIDELITY_INSTRUCTION + r"""
 
 Guidelines:
 - Produce a *complete*, standalone LaTeX document with a preamble.
-- Start with at least: amsmath, amsthm, amssymb, hyperref, geometry
-  (1in margins), microtype, parskip. Add any further \usepackage{...},
-  \newcommand{...}, \DeclareMathOperator{...}, or \newtheorem{...}
-  declarations that the content requires directly in the preamble.
+- Start with at least: amsmath, amsthm, amssymb, geometry (1in margins),
+  microtype, parskip, tikz, tikz-cd, todonotes, then hyperref, and
+  cleveref last (it must load after hyperref). Add any further
+  \usepackage{...}, \newcommand{...}, \DeclareMathOperator{...}, or
+  \newtheorem{...} declarations that the content requires directly in the
+  preamble.
 - Define theorem environments: theorem, lemma, proposition, corollary,
   definition, example, remark, proof (use amsthm).
 - Organize the content into sections and subsections mirroring the lecture's
   logical flow.
 - Render all mathematics properly in LaTeX: inline math with $...$,
   displayed equations with \[ ... \] or align environments.
-- When the speaker writes or draws something, consult the video frames at
-  that moment (using the frame tools or subagent available to you) and
-  transcribe the board/slide content accurately.
-- Use the clarify_transcript tool when a word or phrase in the transcript seems
-  garbled, misheared, or mathematically nonsensical — provide the exact garbled
-  text, the surrounding context, and your best guess. Do not reproduce garbled
-  text in the notes.
-- Use the ask_user tool whenever you are uncertain how to typeset a specific
-  symbol or notation — for example, a symbol that requires a niche package,
-  non-standard blackboard bold, or field-specific convention you are not
-  confident about. Ask instead of silently guessing — then continue
-  provisionally with your best rendering (marked with \todo) until the
-  answer arrives.
-- Use \todo{...} inline to flag any location where you are uncertain about
-  mathematical content rather than typesetting: for example, a formula you
-  could only partially read from a frame, a logical step that seems incomplete,
-  or a passage where your best-effort reconstruction may be wrong. Include
-  \usepackage[colorinlistoftodos]{todonotes} in the preamble. Prefer \todo{}
-  over silently guessing; it lets the human reviewer find and fix uncertain
-  spots in the compiled PDF.
-- Clean up speech disfluencies (um, uh, repetitions) but preserve the
-  lecturer's explanations faithfully.
-- Add \label{} and \ref{} cross-references where appropriate.
-- Do not invent mathematics not present in the lecture. Material you add that
-  the lecturer did not say — a justification, an "equivalently", a slicker
-  proof, a historical attribution — is where errors concentrate. Add it only
-  where you are certain, never present your own reasoning as the lecturer's,
-  and mark a genuinely useful gloss as yours ("Editorially: ...").
-- Preserve the lecturer's confidence. "I think", "morally speaking", "I
-  forgot", "I don't know" are content, not disfluency: keep them. Never turn
-  a hedge into an assertion, or state as settled something the lecturer
-  flagged as open or half-remembered.
-- A correction supersedes what it corrects. Lecturers correct themselves and
-  audiences correct them, sometimes much later in the hour. Write what the
-  lecture concluded — do not restate a retracted claim, and do not reuse a
-  refuted example as though it still supported the point.
-- Never attribute a reference the lecturer did not give. Anything you cite as
-  the work they meant must predate the lecture; a later paper can be cited,
-  but as your own "see also".
-- A \todo does not license a false statement: assert only what you are sure
-  of and put the uncertainty inside the \todo.
+- Put a \label{} on anything the notes refer back to — every theorem, lemma,
+  proposition, corollary, definition and numbered equation you expect to
+  cite. Give labels meaningful names: \label{thm:tilting-equivalence}, not
+  \label{thm:1}.
+""" + CROSSREF_RULE + "\n" + FRAMES_RULE + "\n" + CLARIFY_RULE + r"""
+- Define macros with care.
+""" + MACRO_BRACING_RULE + "\n" + cite_rule(shared=False) + "\n" \
+    + ASK_USER_RULE + "\n" \
+    + TODO_RULE + r""" (Load todonotes in the preamble
+  with \usepackage[colorinlistoftodos]{todonotes}.)
+""" + diagram_rules(board_tools=False) + "\n" + DISPLAY_RULES + "\n" \
+    + DISFLUENCY_RULE + r"""
 - The transcript provides timestamps [hh:mm:ss] before each segment. Use them
   to decide when to call get_frame, and to stamp any question you queue for
   the user — do not include them in the notes themselves.
 
 Write the complete LaTeX document (starting with \documentclass) to the output
 file named in the task instructions. Do not put the LaTeX source in your reply
-text."""
+text.""")
 
-SYSTEM_PROMPT += REGISTER_INSTRUCTION + ATTRIBUTION_INSTRUCTION
+SYSTEM_PROMPT += (REGISTER_INSTRUCTION + HOUSE_STYLE_INSTRUCTION
+                  + ATTRIBUTION_INSTRUCTION)
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +109,14 @@ def check_and_fix(output_path: Path, ctx_factory, backend: str,
     """Compile-check the notes; on failure hand the errors back to the model
     and re-check, up to fix_rounds times."""
     for attempt in range(fix_rounds + 1):
+        # Before every compile, not once at the end: the model is told not to
+        # write bibliography machinery, so if a fix round rewrites the
+        # preamble the \addbibresource goes with it and every \cite turns
+        # into a "Citation undefined" that the next round then tries to fix
+        # by hand.
+        if attach_to_document(output_path, output_path.parent / BIB_FILENAME):
+            print(f"  Wired {BIB_FILENAME} into {output_path.name} "
+                  f"(biblatex + \\printbibliography).")
         errors = check_latex(output_path)
         if errors is None:
             print("(no LaTeX toolchain found on PATH — skipping compile check)")
@@ -209,12 +192,17 @@ def generate(lecture_dir: Path, title: str | None, output_path: Path,
     if video_path is None:
         print("Warning: no video file found — get_frame tool will be unavailable.")
 
+    # Next to the .tex, because biblatex resolves \addbibresource relative to
+    # the document — and the document is the thing that will be moved around.
+    bib_file = output_path.parent / BIB_FILENAME
+
     def make_ctx() -> NotesToolContext:
         return NotesToolContext(
             refs_dir=lecture_dir / "references",
             video_path=video_path,
             total_duration=total_duration,
             transcript_path=transcript_path,
+            bib_file=bib_file,
         )
 
     ctx = make_ctx()
@@ -288,6 +276,7 @@ def answer_followup(lecture_dir: Path, output_path: Path,
             video_path=find_video(lecture_dir),
             total_duration=total_duration,
             transcript_path=lecture_dir / "transcript.json",
+            bib_file=output_path.parent / BIB_FILENAME,
         )
 
     ctx = make_ctx()

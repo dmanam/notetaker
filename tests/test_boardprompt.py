@@ -161,16 +161,15 @@ assert _B.report_unread_boards(_Ctx([1]), []) == []
 print("the unread-board warning says the right thing for each pass")
 
 # --- the board listing must forbid delegated transcription ------------------
-# Measured over a course: write passes that handed batches of boards to
-# subagents failed outright a third of the time (the turn ended with narration
-# where the notes should be, losing the lecture), while every pass that read
-# the stills itself succeeded. It also cost diagrams — prose about a board is
-# not something you can draw a tikzcd from.
+# A write pass that hands batches of boards to subagents fails outright a
+# large fraction of the time: the turn ends with narration where the notes
+# should be, and the lecture is lost. It also costs diagrams — prose about a
+# board is not something you can draw a tikzcd from.
 _boards_for_prompt = [{"id": 1, "path": "/tmp/board-01.jpg", "revisits": 0,
                        "intervals": [[0.0, 60.0]]}]
 _txt = _B.board_index(_boards_for_prompt, attached=False)
 assert "Read them YOURSELF" in _txt
-assert "subagents" in _txt and "third of the time" in _txt
+assert "subagents" in _txt and "narration" in _txt
 # The locator is a deliberate exception and must stay allowed.
 assert "board-locator" in _txt
 # With the images already in the message there is nothing to open, so the

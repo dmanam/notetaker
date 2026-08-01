@@ -1,6 +1,6 @@
 """Follow-up runs: answers are applied once, and \\todo markers are answerable.
 
-Two defects, both reported from a real course:
+Two defects:
 
 1. An answer given *while a lecture was being written* was never marked
    applied — build_course called mark_answers_applied only after a revision

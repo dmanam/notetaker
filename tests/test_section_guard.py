@@ -1,7 +1,7 @@
 """A written section must be a lecture, not the agent's narration.
 
-Lecture 7 of a full run was cached as 826 bytes ending "I'll wait for the
-subagents to complete before continuing." The agent had dispatched five board
+A section was cached as a few hundred bytes ending "I'll wait for the
+subagents to complete before continuing." The agent had dispatched board
 readers, treated the calls as asynchronous and ended its turn; the pipeline saw
 a written file, cached it, and moved on. Nothing warned, and the course lost a
 chapter — the worst kind of failure, because a cached stub looks identical to a

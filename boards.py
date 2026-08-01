@@ -198,8 +198,9 @@ def camera_motion(masks: list, step: int = 5) -> float:
     global translation is the camera. This is what decides whether the
     zoom-merge pass is safe to run: it is only ever needed where an operator
     reframes, and it is only ever harmful where the camera is bolted down.
-    Measured on this course the two styles are a hundred-fold apart, 0.2%
-    against 24%, so the test does not need to be delicate."""
+    The two styles are about a hundred-fold apart — a bolted-down camera
+    shows motion in a fraction of a percent of samples, an operated one in
+    tens of percent — so the test does not need to be delicate."""
     moved = total = 0
     for a, b in zip(masks[::step], masks[step::step]):
         if not (a.any() and b.any()):
@@ -216,32 +217,28 @@ def merge_zoomed(boards: list, threshold: float = 0.72) -> list:
     Gated on camera_motion, because it is right for one camera style and
     wrong for the other.
 
-    The problem is real: one of the two lecturers in the test course is
-    filmed by an operator who reframes constantly, and because the per-frame
-    test compensates for translation but not scale, every zoom reads as a
-    fresh board. That lecturer averages 79 boards a lecture against the
-    other's 28, and consecutive "boards" are demonstrably the same writing
-    at two magnifications.
+    The problem is real. Where an operator reframes constantly, the
+    per-frame test compensates for translation but not scale, so every zoom
+    reads as a fresh board: such a lecture can register three or four times
+    as many boards as a statically filmed one, and consecutive "boards" are
+    demonstrably the same writing at two magnifications.
 
-    But this fix misidentifies the signal. Scoring every consecutive pair on
-    two real lectures:
-
-        Whitlock (21 boards, all genuine)   0.60 … 0.91
-        Ostrand (108 boards, many dupes)    0.22 … 1.00
-
-    No threshold separates them. Genuinely distinct boards score as high as
-    0.91 because consecutive boards on a multi-panel slate legitimately
-    share most of their ink — the metric is a containment score, and
-    containment is high for "same board, more written" and "one panel
-    erased" as well as for "same board, zoomed". At 0.72 this merged 51 of
-    Ostrand's 108 and also 11 of Whitlock's 21, which were correct.
+    But this fix misidentifies the signal. Score every consecutive pair in a
+    lecture and the two populations overlap completely — a reframed lecture
+    spans roughly 0.22 to 1.00, a cleanly filmed one 0.60 to 0.91 — and no
+    threshold separates them. Genuinely distinct boards score high because
+    consecutive boards on a multi-panel slate legitimately share most of
+    their ink: the metric is a containment score, and containment is high
+    for "same board, more written" and "one panel erased" as well as for
+    "same board, zoomed". At 0.72 it merges about half the duplicates and
+    also about half of a clean lecture's boards, which were correct.
 
     Rather than sharpen the metric, the caller asks a question the metric
     cannot: does this camera move at all? Where it does not, no reframe can
     have happened and the pass is skipped entirely. That leaves the static
     lectures exactly as they were and the mobile ones merged — imperfect,
-    since an Ostrand board wrongly merged is still possible, but the failure
-    is bounded to the lectures that need the pass at all.
+    since a board can still be wrongly merged where the pass does run, but
+    the failure is bounded to the lectures that need the pass at all.
 
     A sharper metric would still be better: require the best-fitting scale
     to be clearly different from 1 AND the fit there to beat the fit at
@@ -394,9 +391,9 @@ class _Verifier:
 
     At the coarse analysis size a chalk stroke is about a pixel, so the ink
     mask degenerates into 'there is writing around here' and two unrelated
-    but equally busy boards score alike — measured on a real lecture, an
-    unrelated pair scored 0.75 against a genuine revisit's 0.78. At 512px the
-    same pair scores 0.16 against 0.55. Verification is rare (once per cut),
+    but equally busy boards score alike — an unrelated pair can score 0.75
+    against a genuine revisit's 0.78. At 512px the same pair scores 0.16
+    against 0.55. Verification is rare (once per cut),
     so it can afford the extra frames."""
 
     def __init__(self, video: Path, width: int = VERIFY_WIDTH):

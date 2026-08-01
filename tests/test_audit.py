@@ -55,7 +55,7 @@ print("boards_opened: None, 0 and a clipped list are three distinct answers")
 assert A.diagram_cues(d) == 4, A.diagram_cues(d)     # draw, the diagram, this diagram, diagram chase
 noop = root / "empty"; noop.mkdir()
 assert A.diagram_cues(noop) == 0
-# A distinguished triangle is not a drawing; this course says it constantly.
+# A distinguished triangle is not a drawing, and the phrase is common.
 (noop / "transcript.json").write_text(json.dumps({"segments": [
     {"text": "We get a distinguished triangle and a fibre triangle."}]}))
 assert A.diagram_cues(noop) == 0, "'triangle' must not count as a drawing"

@@ -100,9 +100,9 @@ assert B.same_under_zoom(one, other)[0] < B.ZOOM_MATCH
 print("zoom matcher: reframes 0.6x–2x match, an unrelated board does not")
 
 # --- but it is only ever applied to a camera that moves ---------------------
-# Measured on real lectures: a locked-off camera shows global motion in 0.2%
-# of samples, an operated one in 24%. This is what keeps the merge away from
-# static lectures, where it demonstrably destroyed correct boards.
+# A locked-off camera shows global motion in a fraction of a percent of
+# samples, an operated one in tens of percent. This is what keeps the merge
+# away from static lectures, where it destroys correct boards.
 # A static camera watching a board being written on: the content grows, but
 # nothing translates. (Cycling unrelated masks is NOT this — phase
 # correlation between two different boards peaks wherever it likes, which is

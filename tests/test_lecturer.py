@@ -156,4 +156,13 @@ assert f'"{L.UNKNOWN}"' in L.ATTRIBUTION_INSTRUCTION
 print("the attribution rule is in the writing, checking and single-lecture "
       "prompts")
 
+# Register travels with attribution — both are appended to the writing prompts
+# rather than written into them. (The rest of the shared text, including house
+# typography, is checked in test_instructions.py.)
+import notes_tools as N
+for name, prompt in (("write", B.SYSTEM_PROMPT),
+                     ("single-lecture", G.SYSTEM_PROMPT)):
+    assert N.REGISTER_INSTRUCTION in prompt, name
+print("the register instruction is in both writing prompts")
+
 print("\nALL OK")

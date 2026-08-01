@@ -1,11 +1,10 @@
 """A macro whose body ends in a script must be braced at the definition.
 
 \\Gm defined as \\mathbb{G}_{m} breaks at every call site that adds its own
-script (\\Gm_{A} → "Double subscript"). On this course three separate lectures
-hit it — \\Gm, \\MBerk, \\ur — and each braced its own call sites while the
-definition stayed broken for the other twenty-three. Two prompt changes address
-that: a standing rule in the write prompt, and a targeted note handed to the
-repair pass when the error actually appears.
+script (\\Gm_{A} → "Double subscript"). Left alone, each lecture that hits it
+braces its own call sites while the definition stays broken for every other
+one. Two prompt changes address that: a standing rule in the write prompt, and
+a targeted note handed to the repair pass when the error actually appears.
 """
 import re
 import sys

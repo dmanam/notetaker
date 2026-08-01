@@ -22,6 +22,12 @@ from fetch import arxiv_id_of
 
 DOI_RE = r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+"
 
+BIB_FILENAME = "references.bib"
+BIB_PREAMBLE = ("%% biblatex loads after hyperref; the running bibliography\n"
+                "\\usepackage[backend=biber,style=alphabetic]{biblatex}\n"
+                "\\addbibresource{%s}")
+BIB_PRINT = "\\printbibliography[heading=bibintoc]"
+
 
 def _get(url: str, accept: str | None = None) -> str:
     headers = {"User-Agent": "notetaker/1.0 (academic note-taking tool)"}
@@ -291,3 +297,47 @@ def list_keys(bib_file: Path) -> list[str]:
     if not bib_file.exists():
         return []
     return re.findall(r"@\w+\s*\{\s*([^,\s]+)\s*,", bib_file.read_text())
+
+
+def attach_to_document(tex_file: Path, bib_file: Path) -> bool:
+    """Wire a model-written standalone document up to the .bib it cited into.
+
+    The course assembles its own preamble and can put biblatex where it
+    belongs; a single lecture's document is written by the model, which is
+    told (correctly) never to write bibliography machinery itself. Somebody
+    still has to add it, and doing it here rather than in the prompt is the
+    difference between a rule that holds and a rule that mostly holds.
+
+    \\usepackage goes immediately before \\begin{document}: biblatex must load
+    after hyperref, and that is the one position guaranteed to be after it
+    wherever the model put it. Returns True if the document was changed —
+    False when there is nothing cited, when it is already wired up, or when
+    there is no \\begin{document} to work with (a body-only file).
+
+    Idempotent, because the fix rounds re-run this on a file it already
+    edited.
+    """
+    if not has_entries(bib_file):
+        return False
+    text = tex_file.read_text()
+    if r"\addbibresource" in text and r"\printbibliography" in text:
+        return False
+    if r"\begin{document}" not in text or r"\end{document}" not in text:
+        return False
+    if r"\begin{thebibliography}" in text:
+        # A hand-written bibliography and biblatex would print two lists, and
+        # the \cite keys resolve against only one of them.
+        print("  Warning: the notes contain a hand-written thebibliography; "
+              f"leaving {tex_file.name} alone. The entries collected in "
+              f"{bib_file.name} are not wired in.")
+        return False
+
+    if r"\addbibresource" not in text:
+        text = text.replace(
+            "\\begin{document}",
+            (BIB_PREAMBLE % bib_file.name) + "\n\n\\begin{document}", 1)
+    if r"\printbibliography" not in text:
+        idx = text.rindex("\\end{document}")
+        text = text[:idx] + BIB_PRINT + "\n\n" + text[idx:]
+    tex_file.write_text(text)
+    return True

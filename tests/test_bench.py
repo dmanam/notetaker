@@ -119,8 +119,8 @@ assert styled["style_mismatch"] and not styled["arrows_missing"], styled
 print("style mismatch is reported apart from missing arrows")
 
 s = summarise([r, r2, r3, r4, exact])
-# Only SQUARE is exact: this TRUTH lists five arrows of board 11 rather than
-# all of them, so even the correct diagram registers the rest as invented.
+# Only SQUARE is exact: this TRUTH lists five of the board's arrows rather
+# than all of them, so even the correct diagram registers the rest as invented.
 # That is the rule working, and it is why shipped ground truth is complete.
 assert s["cases"] == 5 and s["exact"] == 1, s
 assert 0 < s["node_recall"] < 1 and s["reversed_arrows"] >= 1

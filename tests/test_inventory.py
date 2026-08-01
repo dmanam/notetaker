@@ -1,10 +1,11 @@
 """The declared-inventory gate on check_diagram.
 
-The failure this exists for: writing up board 11, the model missed the object
-S, hung the map that should have started there onto S_1 instead, left an
-empty cell where S belonged, called check_diagram once at the very end, was
-told about the empty cell, and wrote the notes anyway. Three of its four
-arrow errors were downstream of the one missed object.
+The failure this exists for: reading a board, the model missed one object
+entirely, hung the map that should have started there onto a neighbouring
+object instead, left an empty cell where the missing one belonged, called
+check_diagram once at the very end, was told about the empty cell, and wrote
+the notes anyway. Most of its arrow errors were downstream of that single
+missed object.
 
 Declaring the reading first is the only check that can catch that: every
 other one compares the diagram to itself or to a photograph, and an object
@@ -28,7 +29,7 @@ ctx = NotesToolContext(refs_dir=root / "refs", diagrams_dir=root / "dgm",
                                 "revisits": 0}])
 check = build_handlers(ctx)["check_diagram"]
 
-# Verbatim what the pipeline produced for board 11, and the reading it should
+# Verbatim what the pipeline produced for one board, and the reading it should
 # have declared. S is on the board and missing from the drawing.
 DREW = r"""\begin{tikzcd}
 M_\infty \ar[r] & \cdots \ar[r] & M_2 \ar[r] & M_1 \ar[r, two heads] & M_0 \\

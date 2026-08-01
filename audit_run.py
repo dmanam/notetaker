@@ -83,8 +83,8 @@ def count(pattern: str, text: str) -> int:
 # "this diagram commutes", "a diagram chase" — the lecturer is pointing at
 # something drawn, and a lecture full of these whose notes contain no tikzcd
 # has lost it. Deliberately narrow: "triangle" is excluded because a
-# distinguished triangle is not a drawing, and it is the most common word in
-# this course that would otherwise look like one.
+# distinguished triangle is not a drawing, and it is the most common word
+# that would otherwise look like one.
 _CUES = re.compile(
     r"\bdraw(?:ing|s|n)?\b|\b(?:this|the|that|following|a)\s+diagram\b"
     r"|\bdiagram\s+chase\b|\bpicture\b|\bsketch\b"

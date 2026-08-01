@@ -4,7 +4,7 @@ Turn recorded mathematics lectures into typeset LaTeX notes.
 
 A lecture — local file, URL, or YouTube link — is downloaded, transcribed with
 Whisper, and handed to an agent (Claude or GPT, running on your existing chat
-subscription) that writes graduate-course-style notes. The agent reads the
+subscription) that writes mathematical notes. The agent reads the
 board from video stills, redraws commutative diagrams as TikZ, fetches papers
 the lecturer cites, and queues questions for you without stopping work.
 
@@ -182,15 +182,15 @@ python build_course.py --verify all      # the whole course
 
 ### Who is lecturing
 
-Notes written by a professional say "Whitlock defines", not "the speaker
+Notes written by a professional say e.g. "Bourbaki defines", not "the speaker
 claims" — surname alone. Nothing in a video file reliably carries a name, so
 each new lecture's speaker is asked once, before any model runs, with a guess
 offered as the default:
 
 ```sh
-python build_course.py … --lecturer "Felix Klein"   # one speaker, no questions
-python build_course.py …                            # asked per lecture
-python lecturer.py output                           # just show the guesses
+python build_course.py … --lecturer "Nicolas Bourbaki"  # one speaker, no questions
+python build_course.py …                                # asked per lecture
+python lecturer.py output                               # just show the guesses
 ```
 
 Answers are saved and never re-asked. With no terminal attached the guesses are
@@ -299,6 +299,7 @@ output/
     transcript.json           Whisper output
     info.json                 metadata
     notes.tex                 standalone notes (generate_notes)
+    references.bib            its own bibliography, alongside notes.tex
     section.tex               course section
     summary.md                digest for later lectures
     boards/                   board stills + boards.json
@@ -334,6 +335,28 @@ returns the key. The same source cited from several lectures reuses one entry.
 biblatex is wired in only once something is actually cited, and the compile
 check runs biber, so undefined citations are reported rather than silently
 rendering as `[?]`.
+
+`generate_notes.py` collects citations the same way, into a `references.bib`
+next to its `notes.tex`. Since that document's preamble is written by the
+model — which is told never to write bibliography machinery — the `biblatex`
+lines and `\printbibliography` are attached mechanically before each compile
+round, so a repair pass that rewrites the preamble cannot take them with it.
+
+### One prompt, two entry points
+
+The course assembler and the single-lecture writer share most of what their
+system prompt says: how to treat an ASR transcript, what not to invent, when to
+draw a diagram, which dash to set. That text lives in `instructions.py` and is
+composed into both. What stays in each driver is what is genuinely different —
+body-only output versus a whole document, lecture-numbered labels, the preamble
+tool, the theorem environments that already exist. Two blocks are parameterised
+rather than duplicated, since only one clause of each depends on which tools the
+driver has.
+
+This is not cosmetic. When the two prompts were maintained separately they
+drifted: the course prompt banned `\ref` in favour of cleveref while the
+single-lecture prompt still asked for it, and the diagram, fidelity and display
+rules existed in only one of them.
 
 ### Boards: recovering what was drawn
 
