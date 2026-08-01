@@ -249,7 +249,20 @@ def fetch_reference(url_or_id: str, refs_dir: Path) -> dict:
     if meta_path.exists() and text_path.exists():
         with open(meta_path) as f:
             meta = json.load(f)
-        meta["text"] = text_path.read_text()
+        assets = meta.setdefault("assets", {})
+        # Caches written before outlines existed get one on first reuse.
+        if not assets.get("outline"):
+            outline = write_outline(ref_dir, assets, text_path)
+            if outline:
+                assets["outline"] = str(outline.relative_to(base))
+                with open(meta_path, "w") as f:
+                    json.dump(meta, f, indent=2)
+        rel_outline = assets.get("outline")
+        # Clip on the way out: text.txt holds the full document now, and a
+        # cache hit must not put 450k of it into the prompt.
+        meta["text"] = clip_for_prompt(
+            text_path.read_text(), text_path,
+            base / rel_outline if rel_outline else None)
         return meta
 
     ref_dir.mkdir(parents=True, exist_ok=True)
@@ -321,11 +334,14 @@ def fetch_reference(url_or_id: str, refs_dir: Path) -> dict:
     if not title:
         title = cache_key
 
-    if len(text) > MAX_CHARS:
-        text = text[:MAX_CHARS] + f"\n\n[… truncated at {MAX_CHARS:,} characters]"
-
-    # Persist
+    # Persist the FULL extraction, then clip only the copy that goes into the
+    # prompt. Truncating before writing used to throw the tail away entirely,
+    # so "read the rest from the cached file" was not actually possible.
     text_path.write_text(text)
+    outline = write_outline(ref_dir, assets, text_path)
+    if outline:
+        assets["outline"] = rel(outline)
+    text = clip_for_prompt(text, text_path, outline)
     meta = {
         "url": url,
         "original": url_or_id,
@@ -339,6 +355,111 @@ def fetch_reference(url_or_id: str, refs_dir: Path) -> dict:
 
     meta["text"] = text
     return meta
+
+
+def clip_for_prompt(text: str, path: Path, outline: Path | None = None) -> str:
+    """Cut a document down to what fits in a prompt, telling the model exactly
+    how to get the rest. A bare '[truncated]' marker is a dead end: it says
+    content is missing but not how much, where the full copy is, or what to do
+    — so the model retries the same read or fills the gap by guessing."""
+    if len(text) <= MAX_CHARS:
+        return text
+    shown, total = MAX_CHARS, len(text)
+    note = [
+        f"[Only the first {shown:,} of {total:,} characters are shown here "
+        f"({100 * shown // total}%).",
+        f"The COMPLETE text is on disk at: {path}",
+        "To see the rest, do not re-fetch — read that file directly in ranges "
+        "with your file-reading tool (offset/limit), or search it with "
+        "search_document / grep for the term you need.",
+    ]
+    if outline is not None:
+        note.append(f"An outline with line numbers is at: {outline} — use it "
+                    f"to jump straight to the relevant part.")
+    return text[:shown] + "\n\n" + "\n".join(note) + "]"
+
+
+_TEX_HEADING = re.compile(
+    r"\\(part|chapter|section|subsection|subsubsection)\*?\s*\{", re.M)
+_TEX_ENV = re.compile(
+    r"\\begin\{(theorem|proposition|lemma|corollary|definition|remark|"
+    # greedy to the last ] on the line: titles contain brackets themselves,
+    # as in \begin{theorem}[Freeness of $\Z[S]$]
+    r"example|conjecture)\}[ \t]*(\[[^\n]*\])?")
+
+
+def _balanced(text: str, open_idx: int) -> str:
+    depth = 0
+    for j in range(open_idx, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return " ".join(text[open_idx + 1:j].split())
+    return ""
+
+
+def write_outline(ref_dir: Path, assets: dict, text_path: Path) -> Path | None:
+    """Write outline.txt: headings with line numbers for TeX sources, the
+    bookmark table for PDFs. Large papers are otherwise navigated by reading
+    linearly until the read is cut off."""
+    lines: list[str] = []
+
+    src = assets.get("source_dir")
+    if src:
+        src_dir = ref_dir.parent.parent / src if not (ref_dir / src).exists() \
+            else ref_dir / src
+        src_dir = src_dir if src_dir.exists() else ref_dir / "source"
+        for tex in sorted(src_dir.rglob("*.tex")) if src_dir.exists() else []:
+            try:
+                body = tex.read_text(errors="replace")
+            except OSError:
+                continue
+            found = []
+            for m in _TEX_HEADING.finditer(body):
+                title = _balanced(body, m.end() - 1)
+                if title:
+                    found.append((body.count("\n", 0, m.start()) + 1,
+                                  m.group(1), title))
+            for m in _TEX_ENV.finditer(body):
+                label = (m.group(2) or "").strip("[]")
+                found.append((body.count("\n", 0, m.start()) + 1,
+                              m.group(1), label))
+            if found:
+                lines.append(f"== {tex.name} ({len(body):,} chars) ==")
+                for lineno, kind, title in sorted(found):
+                    lines.append(f"  line {lineno:>6}  {kind:<13} {title}"
+                                 .rstrip())
+                lines.append("")
+
+    pdf = assets.get("pdf")
+    if pdf:
+        pdf_path = ref_dir / Path(pdf).name
+        if pdf_path.exists():
+            try:
+                import fitz
+                with fitz.open(pdf_path) as doc:
+                    toc = doc.get_toc()
+                    if toc:
+                        lines.append(f"== {pdf_path.name} "
+                                     f"({doc.page_count} pages) ==")
+                        for level, title, page in toc:
+                            lines.append(f"  page {page:>4}  "
+                                         f"{'  ' * (level - 1)}{title}")
+                        lines.append("")
+            except Exception:
+                pass
+
+    if not lines:
+        return None
+    out = ref_dir / "outline.txt"
+    out.write_text(
+        f"Outline of the cached copies of this reference.\n"
+        f"Full extracted text: {text_path} ({text_path.stat().st_size:,} bytes)"
+        f"\nUse the line numbers to read just the part you need.\n\n"
+        + "\n".join(lines))
+    return out
 
 
 def describe_assets(meta: dict, base: Path) -> str:
@@ -357,6 +478,22 @@ def describe_assets(meta: dict, base: Path) -> str:
                      f"extracted text looks garbled")
     if assets.get("html"):
         lines.append(f"  HTML: {base / assets['html']}")
+    if assets.get("outline"):
+        lines.append(f"  Outline: {base / assets['outline']}  <- headings and "
+                     f"theorem environments with line numbers; read this "
+                     f"first for a long document and jump to the part you "
+                     f"need instead of reading from the top")
+    if meta.get("local_path"):
+        full = base / meta["local_path"]
+        try:
+            size = full.stat().st_size
+        except OSError:
+            size = 0
+        if size:
+            lines.append(f"  Full extracted text: {full} ({size:,} bytes)"
+                         + ("  <- longer than fits in one read; use the "
+                            "outline, or search_document, or read it in "
+                            "ranges" if size > MAX_CHARS else ""))
     if not lines:
         return ""
     return ("Cached locally (open with your file tools / view_pdf_page):\n"
@@ -364,8 +501,16 @@ def describe_assets(meta: dict, base: Path) -> str:
 
 
 def load_cached_reference(meta: dict, output_root: Path) -> dict:
-    """Re-attach .text to a metadata dict loaded from state."""
+    """Re-attach .text to a metadata dict loaded from state. The cached file
+    now holds the full extraction, so clip it the same way a fresh fetch
+    does — otherwise a 450k source would land whole in the prompt."""
     if "text" not in meta:
         p = output_root / meta["local_path"]
-        meta["text"] = p.read_text() if p.exists() else ""
+        if p.exists():
+            outline = meta.get("assets", {}).get("outline")
+            meta["text"] = clip_for_prompt(
+                p.read_text(), p,
+                output_root / outline if outline else None)
+        else:
+            meta["text"] = ""
     return meta

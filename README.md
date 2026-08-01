@@ -92,6 +92,16 @@ untranscribed ones after a crash), so you can process a series incrementally. Ad
 which lectures to `--regen`. Transcript mishearings you confirm once (e.g.
 "at all" → "étale") are passed to all later lectures automatically.
 
+Every agent that touches a section — writing it, revising it after your
+answers, verifying it, propagating a change, or fixing a LaTeX error — is
+given an **index of the other lectures** (title, notes path, summary path) and
+a listing of **what is already in the bibliography**. The first means a fix
+that turns on what an earlier lecture actually said has something to work
+from; the second stops an agent re-deriving an arXiv ID or DOI, and
+re-searching the web, for a source that is already cited. Both are indexes
+rather than content — full summaries run to hundreds of kilobytes across a
+long course — so the agent opens what it needs.
+
 A **running bibliography** accumulates in `output/references.bib`: when a
 lecture cites something the agent calls a `cite_reference` tool, which
 fetches a real BibTeX entry (arXiv and DOI metadata are pulled
@@ -100,6 +110,228 @@ automatically; anything else becomes a web entry) and returns the key to
 biblatex and `\printbibliography` are wired into the assembled document only
 once something has actually been cited, and the compile check runs biber, so
 undefined citations are reported rather than silently rendering as `[?]`.
+
+### Who is lecturing
+
+Notes written by a professional say "Whitlock defines" and "as Ostrand pointed
+out" — surname alone — not "Dana says" or "the speaker claims". That needs a
+name, and nothing in a video file reliably has one: the transcript rarely says
+it and the uploader is an institution. So each new lecture's speaker is asked
+once, before any model runs, with a guess offered as the default:
+
+```sh
+python build_course.py … --lecturer "Dana Whitlock"   # one speaker, no questions
+python build_course.py …                              # asked per lecture
+python lecturer.py output                             # just show me the guesses
+```
+
+The guess is a single cheap model call over the whole series rather than a
+pattern per title. The hard part is not spotting two capitalised words but
+deciding which pair is a person — `Spectral Sequences | Marek Ostrand` has two
+candidates — and seeing every title at once settles it: a phrase in all of
+them is the series, a name in only some is a speaker the series alternates
+with. On the 24-lecture test course it gets all 24 right, including the
+alternation between the two lecturers, for about $0.07 API-equivalent.
+
+A wrong name is worse than none, because it gets printed as an attribution, so
+the guesser is told to answer "unknown" rather than reach — it declines on
+`Homotopy Theory 4` even when the transcript opens by discussing Quillen — and
+everything unnamed falls back to the phrase "the lecturer". Press Enter to
+accept a suggestion, `?` to decline it. Answers live in
+`output/course_state.json` and are never re-asked; with no terminal the
+suggestions are taken silently, so unattended runs still work. `--lecturer`
+also applies in `--verify` and `--answer` mode, which is how a course written
+before a name was recorded gets one.
+
+## Exporting as a multi-file LaTeX project
+
+`course.tex` is one large assembled file. To get something editable and
+version-controllable instead:
+
+```sh
+python build_course.py --export ~/notes/advanced-topology [--export-compile]
+```
+
+```
+main.tex                       preamble, \input lines, bibliography
+lectures/01-<slug>.tex         one file per lecture (body only)
+lectures/02-<slug>.tex
+references.bib
+```
+
+`main.tex` builds with `latexmk -pdf main.tex` and is self-contained —
+the same preamble, `\newcommand`s and bibliography wiring as the single-file
+build, which it shares code with so the two cannot drift. Lecture files are
+numbered by lecture order and hold only body content; filenames are
+sanitized for `\input` (an underscore in a slug would otherwise be read as a
+subscript). `--export-compile` compile-checks the result.
+
+With no videos given it exports from the saved state and exits; passed
+alongside a normal run, `--answer`, or `--verify`, it exports at the end.
+Bodies are read fresh from each `section.tex`, so hand edits are picked up.
+
+## Boards: recovering what was drawn
+
+A transcript is linear audio, so everything the lecturer *drew* is lost. Every
+lecture with a video is therefore segmented into board states before any notes
+are written — on by default, since a lecture written from the transcript alone
+gets notation wrong:
+
+```sh
+python build_course.py …                        # segmentation included
+python build_course.py … --no-boards            # skip it
+python build_course.py … --boards-color         # analyse in colour
+python boards.py output/<slug>/video.mkv        # standalone
+```
+
+```
+output/<slug>/boards/boards.json     every board, with the intervals it was current
+output/<slug>/boards/board-07.jpg    a clean snapshot of that board at its fullest
+```
+
+No ML and no new dependencies — ffmpeg for pixels, numpy for the rest:
+
+1. Sample at 1 fps, downscaled, greyscale by default (`--boards-color` if
+   colour carries meaning).
+2. **Remove the lecturer** with a sliding temporal median: they move, the
+   writing does not, so the median over a window of seconds is the board
+   alone. The saved snapshots are built the same way at full size, so the
+   lecturer is not standing in front of the thing you wanted to read.
+3. Reduce each frame to an *ink mask* — pixels of high local contrast, so it
+   works for chalk on black or marker on white. The contrast threshold is
+   computed **once for the whole video**: a per-frame threshold would mark
+   the same fraction of every frame as ink, and a full board would score
+   identically to a wiped one.
+4. Track boards by ink **containment**, which is deliberately asymmetric.
+   Adding writing leaves the old ink present, so it stays the same board;
+   erasing it drops sharply, which ends the board. Frames are
+   motion-compensated by phase correlation first, so a camera pan is
+   recognised as motion rather than as an erasure.
+
+That containment test is what handles the awkward cases: writing more on an
+earlier board, and the camera panning away and coming back, both add an
+interval to an existing board instead of inventing a new one. Returning to a
+board after a different one is recorded as a genuine revisit, with the two
+intervals kept separate.
+
+Each board's snapshot is taken at its **ink peak** — the moment just before
+it was erased, when it is most complete.
+
+### The stills go to the model that writes
+
+Once segmented, the boards are part of the prompt for every agent that writes
+or checks a lecture — the writer, the reviser and the verifier. They arrive
+two ways at once: an index listing each board with the intervals it was up,
+and a marker spliced into the transcript at the moment each board goes up, so
+the board that was current is visible right where the model is reading.
+
+```
+[00:23:12] === board 7 up: /…/boards/board-07.jpg ===
+[00:23:14]  and so this map here is injective …
+```
+
+On the `api` backend the stills are attached to the first message directly,
+inside the cached prefix. On the other backends they are listed by path and
+the model opens them itself.
+
+They go to the *main* model rather than to a cheap one on purpose. Reading
+handwritten mathematics is under-determined by the pixels — ∂ against δ, an
+`f` against an `f̃`, `↪` against `→` — and what resolves it is knowing the
+subject, the lecturer's notation and the previous lectures. A summary written
+by a small model is a lossy read of the densest artifact in the lecture, and
+it saves about $4 across a 24-lecture course. The prompt therefore tells the
+model to prefer the board over the transcript where the two disagree about a
+symbol: the transcript is a guess at speech, and it mangles notation that was
+never spoken aloud.
+
+The `get_frame` tool remains available for when a snapshot is missing or
+garbled, but its description now discourages it: a single raw frame may catch
+a mid-erasure, a pan, or the lecturer's back.
+
+### Diagrams: redrawn, never photographed
+
+A photograph cannot go into the notes, and prose is a bad substitute for a
+commutative diagram, so what the lecturer drew is redrawn as TikZ. `tikz-cd`
+and tikz are in the default preamble, and the work splits like this:
+
+1. the **board-locator**, on the cheap model, is asked *where* the diagram is
+   and returns a box. It does not read mathematics and does not draw;
+2. `crop_board` returns that region **at native resolution**. This is the
+   whole point of the crop: sending a full still downscales it to the vision
+   model's long-edge ceiling and a chalk arrowhead survives as a pixel or two,
+   whereas the cropped region arrives un-shrunk. It never scales *up* —
+   interpolation invents no chalk — which is also why stills are stored on
+   disk at full resolution rather than at the ceiling;
+3. the **main model** reads the diagram off the crop and writes the TikZ. An
+   arrow direction is a mathematical claim, not a typesetting choice, and the
+   main model is the one that knows what the lecture proves;
+4. `check_diagram` compiles the snippet **alone** — so a broken diagram cannot
+   take the course build down — and hands the render back to compare against
+   the crop.
+
+That division was measured, not assumed. With the cheap model doing the
+drawing, it reversed the arrows on a lifting diagram three times running,
+including once after twenty-four magnified looks at the board; the error was
+caught only because the main model checked the reported directions against the
+mathematics. Locating a region it can do reliably. Reading an arrowhead it
+cannot.
+
+If a diagram cannot be read off the board, the notes fall back to prose with a
+`\todo` rather than carrying a confident, wrong diagram. Placeholder comments
+left where a diagram should be (`% DIAGRAM_PLACEHOLDER`) compile silently and
+are invisible in the PDF, so they are reported after every run.
+
+## What the agents did: output/logs/
+
+Every agent invocation is recorded, so a bad section can be traced back to
+what the agent actually saw and did:
+
+```
+output/logs/index.jsonl                      one summary line per agent run
+output/logs/<ts>-<role>-<lecture>.jsonl      that run's full event trace
+```
+
+The index carries role (`write`, `verify`, `revise`, `propagate`,
+`fix-latex`, `fix-preamble`), lecture, backend and model, wall-clock seconds,
+token usage and cost, a histogram of tool calls, and the outcome (chars
+written, todos and open questions left, whether it fell back to saving its
+chat output). The trace has one line per event — each tool call with its
+input, a clipped result and how long it took, each thing the agent said, and
+a final summary.
+
+```sh
+python build_course.py --logs      # digest: which agents ran, cost, tool counts
+```
+
+Both files are JSON Lines, so aggregating is a couple of lines of Python —
+which is the point: "frame readers average 11 tool calls", "the verifier
+spent 40s grepping before finding the label" is how the prompts above got
+written. Logging never interferes with a run: writes are best-effort and a
+failure disables logging with a note rather than raising.
+
+## Long documents
+
+A fetched paper can run to hundreds of thousands of characters — more than
+fits in one read. Three things keep an agent from flailing at one:
+
+- **The full text is cached**, and only the prompt copy is clipped. The clip
+  says how much was shown, how much exists, where the file is, and how to
+  read the rest (ranges, or `search_document`) — a bare `[truncated]` marker
+  told the model something was missing but not what to do about it.
+- **`outline.txt`** is written next to each cached reference: every
+  `\section`/`\subsection` and theorem-like environment with its line number,
+  plus the PDF bookmarks with page numbers. A 457k TeX source becomes an 8.7k
+  outline (226 headings), so the agent jumps to a line instead of reading
+  from the top. Existing caches get one on first reuse.
+- **`search_document`** greps a cached file or a whole unpacked source tree
+  and returns matching lines with line numbers and context — the fastest way
+  to find a theorem or a symbol in a long paper, and available on every
+  backend (the codex one has no native grep over these paths).
+
+Agents are also told not to open `course.tex`: it is every lecture
+concatenated (about a megabyte in a full course) and will be cut off long
+before the part they wanted. The per-lecture files are what the lecture index
+points at.
 
 ## Accuracy: every lecture is checked by a second pass
 
@@ -174,10 +406,14 @@ skip) and reassembles `course.tex`. `--answer` is also useful with no open
 questions at all, as a pure todo-sweep pass. Hand edits to a `section.tex`
 are safe: assembly prefers the file on disk.
 
-`--answer-all` walks the whole course: it first lists every lecture with
-open questions or todos, then works through them in order, and finally
-propagates once — each later lecture is visited a single time carrying the
-changes from every revised lecture before it, rather than being rewritten
+`--answer-all` walks the whole course in two phases. It lists every lecture
+with open questions or todos and puts **all** of those questions to you in
+one sitting; only then do the models start, so you are not stranded at the
+terminal waiting for one lecture's revision to finish before being asked the
+next question. The revision phase is unattended — questions the agents raise
+along the way are queued for the next follow-up rather than waited on. It
+then propagates once: each later lecture is visited a single time carrying
+the changes from every revised lecture before it, rather than being rewritten
 once per revision.
 
 ## Compile errors get fixed, not just reported

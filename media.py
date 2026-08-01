@@ -54,9 +54,25 @@ def normalize_timestamp(value: float | int | str | None) -> str | None:
     return None if seconds is None else format_timestamp(seconds)
 
 
-def format_transcript(segments: list[dict]) -> str:
-    return "\n".join(f"[{format_timestamp(seg['start'])}] {seg['text']}"
-                     for seg in segments)
+def format_transcript(segments: list[dict],
+                      marks: list[tuple[float, str]] | None = None) -> str:
+    """The transcript, optionally with `marks` spliced in at their timestamps.
+
+    Used to interleave board changes, so that the moment the lecturer starts
+    a new board is visible in the place where the model is reading about it
+    rather than only in an index far above."""
+    lines: list[str] = []
+    pending = sorted(marks or [], key=lambda m: m[0])
+    i = 0
+    for seg in segments:
+        start = seg["start"]
+        while i < len(pending) and pending[i][0] <= start:
+            lines.append(pending[i][1])
+            i += 1
+        lines.append(f"[{format_timestamp(start)}] {seg['text']}")
+    for at, text in pending[i:]:
+        lines.append(text)
+    return "\n".join(lines)
 
 
 def _ffmpeg_frame(video_path: Path, timestamp: float, out_path: str) -> bool:

@@ -35,11 +35,14 @@ import sys
 from pathlib import Path
 
 from claude_backend import (BACKENDS, collect_followup_answers, count_todos,
-                            run_agent)
+                            mark_answers_applied, run_agent)
 from latex_check import check_latex, print_errors
 from fetch import describe_assets, fetch_reference
 from media import find_video, format_transcript
-from notes_tools import NotesToolContext
+from notes_tools import (NotesToolContext, REGISTER_INSTRUCTION,
+                         style_exemplar_block)
+from lecturer import (ATTRIBUTION_INSTRUCTION, lecturer_note,
+                      resolve as resolve_lecturers)
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -118,6 +121,8 @@ Write the complete LaTeX document (starting with \documentclass) to the output
 file named in the task instructions. Do not put the LaTeX source in your reply
 text."""
 
+SYSTEM_PROMPT += REGISTER_INSTRUCTION + ATTRIBUTION_INSTRUCTION
+
 
 # ---------------------------------------------------------------------------
 # Compile check, with the model fixing what it broke
@@ -168,6 +173,7 @@ def check_and_fix(output_path: Path, ctx_factory, backend: str,
             model=model,
             frame_model=frame_model,
             revise=True,
+            role="fix-latex", log_dir=output_path.parent / "logs",
         )
     print("  Remaining errors need a manual look "
           "(or another --latex-fix-rounds pass).")
@@ -181,7 +187,9 @@ def generate(lecture_dir: Path, title: str | None, output_path: Path,
              references: list[dict] | None = None,
              backend: str = "subscription", model: str | None = None,
              frame_model: str | None = None, wait: bool = False,
-             fix_rounds: int = 2) -> None:
+             fix_rounds: int = 2,
+             style_exemplars: list | None = None,
+             lecturer: str | None = None) -> None:
     # Load transcript
     transcript_path = lecture_dir / "transcript.json"
     if not transcript_path.exists():
@@ -206,6 +214,7 @@ def generate(lecture_dir: Path, title: str | None, output_path: Path,
             refs_dir=lecture_dir / "references",
             video_path=video_path,
             total_duration=total_duration,
+            transcript_path=transcript_path,
         )
 
     ctx = make_ctx()
@@ -223,9 +232,11 @@ def generate(lecture_dir: Path, title: str | None, output_path: Path,
         refs_block = "\n\n".join(parts) + "\n\n"
 
     user_text = (
+        f"{style_exemplar_block(style_exemplars)}"
         f"{refs_block}"
         f"Please write up the following lecture as LaTeX notes.\n\n"
         f"**Title:** {title}\n\n"
+        f"{lecturer_note(lecturer)}"
         f"**Transcript:**\n\n{transcript_text}"
     )
 
@@ -243,6 +254,7 @@ def generate(lecture_dir: Path, title: str | None, output_path: Path,
         model=model,
         frame_model=frame_model,
         wait_for_answers=wait,
+        role="write", log_dir=lecture_dir / "logs",
     )
 
     print(f"\nDone. Frame requests: {ctx.frame_requests}")
@@ -275,6 +287,7 @@ def answer_followup(lecture_dir: Path, output_path: Path,
             refs_dir=lecture_dir / "references",
             video_path=find_video(lecture_dir),
             total_duration=total_duration,
+            transcript_path=lecture_dir / "transcript.json",
         )
 
     ctx = make_ctx()
@@ -307,7 +320,9 @@ def answer_followup(lecture_dir: Path, output_path: Path,
         frame_model=frame_model,
         revise=True,
         wait_for_answers=wait,
+        role="revise", log_dir=lecture_dir / "logs",
     )
+    mark_answers_applied(ctx, output_path)
     print(f"\nRevised: {output_path}")
     check_and_fix(output_path, make_ctx, backend, model, frame_model,
                   fix_rounds)
@@ -352,6 +367,15 @@ def main():
                              "an earlier run and have the agent revise the "
                              "existing notes (also sweeps remaining \\todo "
                              "markers).")
+    parser.add_argument("--lecturer", metavar="NAME", default=None,
+                        help="Who gave this lecture. The notes refer to them "
+                             "by surname, as published notes do. Without this "
+                             "you are asked once, with a guess from the title "
+                             "offered as the default.")
+    parser.add_argument("--style-exemplar", metavar="FILE", action="append",
+                        default=[],
+                        help="A file whose writing style the notes should "
+                             "imitate (register only, never content). Repeatable.")
     parser.add_argument("--latex-fix-rounds", type=int, default=2, metavar="N",
                         help="When the notes fail to compile, hand the errors "
                              "back to the model and re-check, up to N times "
@@ -381,9 +405,15 @@ def main():
         except Exception as exc:
             print(f"  Warning: could not fetch {url_or_id}: {exc}")
 
+    names = resolve_lecturers([lecture_dir], {}, forced=args.lecturer,
+                              backend=args.backend, model=args.model,
+                              frame_model=args.frame_model,
+                              work_dir=lecture_dir / "lecturers",
+                              log_dir=lecture_dir / "logs")
     generate(lecture_dir, args.title, output_path, references,
              args.backend, args.model, args.frame_model, args.wait,
-             args.latex_fix_rounds)
+             args.latex_fix_rounds, args.style_exemplar,
+             lecturer=names.get(lecture_dir.name))
 
 
 if __name__ == "__main__":

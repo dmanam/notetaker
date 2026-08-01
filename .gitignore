@@ -1,2 +1,10 @@
-__pycache__
-output
+__pycache__/
+*.pyc
+
+*.log
+
+# Course artifacts: videos, transcripts, board stills, generated notes.
+output/
+
+# Style examples for the notetaker to reference
+exemplars/

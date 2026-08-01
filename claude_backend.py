@@ -26,6 +26,7 @@ NotesToolContext.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -33,6 +34,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from agent_log import start_log
 from media import extract_frame, format_timestamp, parse_timestamp
 from notes_tools import (FRAME_READER_PROMPT, NotesToolContext, ToolResult,
                          backfill_question_timestamps, build_handlers,
@@ -177,24 +179,50 @@ def collect_followup_answers(ctx: NotesToolContext, output_file: Path,
             print(f"(recovered timestamps for {filled} earlier question(s))",
                   file=sys.stderr)
     open_qs = [q for q in ctx.questions if is_open(q)]
-    if not open_qs:
+    # Answers collected by an earlier run that never reached the model — the
+    # run was killed between asking and revising. They must be re-delivered,
+    # not re-asked: "delivered" only records that we took the answer off the
+    # user, "applied" records that the notes were actually updated with it.
+    unapplied = [q for q in ctx.questions
+                 if not is_open(q) and q.get("answer") is not None
+                 and not q.get("applied")]
+    if not open_qs and not unapplied:
         return None
-    print(f"{len(open_qs)} question(s) left open by earlier runs:",
-          file=sys.stderr, flush=True)
+    if unapplied:
+        print(f"{len(unapplied)} answer(s) from an earlier run were never "
+              f"applied — re-delivering them (you will not be asked again).",
+              file=sys.stderr, flush=True)
+    if open_qs:
+        print(f"{len(open_qs)} question(s) left open by earlier runs:",
+              file=sys.stderr, flush=True)
     for q in open_qs:
         q["answer"] = None
         q["deferred"] = False
         q["delivered"] = False
     broker = ensure_broker(ctx)
     broker.finish()
-    deliverable = []
+    deliverable = list(unapplied)
     for q in broker.drain_new():
         if q.get("deferred"):
             q["delivered"] = False  # stays open for the next follow-up
         else:
             deliverable.append(q)
     save_questions(ctx, output_file)
+    deliverable = sorted({q["id"]: q for q in deliverable}.values(),
+                         key=lambda q: q["id"])
     return format_answers(deliverable) if deliverable else None
+
+
+def mark_answers_applied(ctx: NotesToolContext, output_file: Path) -> None:
+    """Record that the revision agent has run, so these answers are not
+    re-delivered next time. Called only after the agent finishes."""
+    changed = False
+    for q in ctx.questions:
+        if q.get("answer") is not None and not q.get("applied"):
+            q["applied"] = True
+            changed = True
+    if changed:
+        save_questions(ctx, output_file)
 
 
 def _revision_message(items: list[dict]) -> str:
@@ -221,6 +249,9 @@ def run_agent(
     revise: bool = False,
     wait_for_answers: bool = False,
     summary_file: Path | None = None,
+    images: list[tuple[Path, str]] | None = None,
+    role: str = "agent",
+    log_dir: Path | None = None,
 ) -> str:
     """Run the agentic loop; return the LaTeX the agent wrote to output_file.
 
@@ -243,6 +274,22 @@ def run_agent(
             output_file.rename(backup)
 
     ctx.usage = Usage()  # filled by the backend; read by callers afterwards
+    resolved_model = model or {"subscription": SUBSCRIPTION_MODEL,
+                               "codex": CODEX_MODEL}.get(backend, API_MODEL)
+    ctx.log = start_log(
+        log_dir, role=role, lecture=output_file.parent.name,
+        backend=backend, model=resolved_model,
+        frame_model=frame_model, revise=revise,
+        output_file=str(output_file),
+        system_prompt_chars=len(system_prompt),
+        user_prompt_chars=len(user_text),
+        # The opening lines say which task this was; the body is usually a
+        # whole transcript, which does not belong in a log.
+        user_prompt_head=user_text[:1500])
+    if log_dir and getattr(ctx.log, "path", None):
+        # The codex backend runs tools in an MCP subprocess; it needs the
+        # path to append to the same trace.
+        ctx.log_file = ctx.log.path
     system_prompt = system_prompt + ASYNC_QA_INSTRUCTION + RESEARCH_INSTRUCTION
     full_user = user_text + _write_instruction(backend, output_file, revise)
     if summary_file is not None:
@@ -285,7 +332,7 @@ def run_agent(
         fallback = _run_api(system_prompt, full_user, ctx, output_file,
                             model or API_MODEL,
                             frame_model or API_FRAME_MODEL, max_tokens,
-                            wait_for_answers)
+                            wait_for_answers, images=images)
     else:
         raise ValueError(f"Unknown backend: {backend!r} (expected one of {BACKENDS})")
 
@@ -306,6 +353,19 @@ def run_agent(
         print(f"\nLLM usage: {format_usage(ctx.usage)}", file=sys.stderr)
     n_open = sum(1 for q in ctx.questions if is_open(q))
     n_todo = count_todos(text)
+    ctx.log.close(
+        cost=format_usage(ctx.usage) if ctx.usage.any() else "",
+        usage=ctx.usage.to_dict(),
+        wrote_output=output_file.exists() and output_file.stat().st_size > 0,
+        used_fallback=not (output_file.exists()
+                           and output_file.stat().st_size > 0),
+        output_chars=len(text),
+        open_questions=n_open,
+        todos=n_todo,
+        questions_asked=len(ctx.questions),
+        frames=ctx.frame_requests,
+        corrections=list(ctx.new_corrections),
+        reply=fallback[-600:] if fallback else "")
     if n_open or n_todo:
         print(f"\nNote: {n_open} open question(s) and {n_todo} \\todo "
               f"marker(s) remain (any prompt still on screen was cancelled). "
@@ -422,9 +482,224 @@ only when its report is ambiguous, incomplete, or mathematically implausible
 and the passage is important."""
 
 
+BOARD_LOCATOR_PROMPT = """\
+You find things on a photograph of a lecturer's blackboard. You do not read
+the mathematics and you do not draw anything — you say WHERE something is.
+
+You are given the still and a description of what is wanted: usually one
+diagram, sometimes a formula or a corner of the board. Your job is to return
+the tightest box that contains all of it.
+
+The box is fractional, relative to the whole still: x and y are the top-left
+corner, width and height the extent, each between 0 and 1.
+
+- Include every part of the thing asked for. A diagram's stray arrow off to
+  one side, a label written above it, an annotation in the margin joined to it
+  by an arrow — all inside the box. A box that clips an arrow is worse than a
+  box that is too big.
+- Do not include the whole board out of caution either. The point of the crop
+  is that the region arrives at full resolution instead of being shrunk with
+  the rest of the slate, and a box covering everything buys nothing.
+- Lecture-hall boards are often several sliding panels. If what was asked for
+  is on one panel, box that panel, not the frame.
+- Use crop_board if you need a closer look to place the edges. That is what it
+  is for; it does not sharpen anything, it only crops.
+
+Reply with the box as JSON and nothing else:
+
+  {"x": 0.5, "y": 0.18, "width": 0.48, "height": 0.5, "note": "right panel"}
+
+`note` is one short phrase saying what you boxed, so the reader can tell you
+understood the request. If you cannot find what was asked for anywhere on the
+board, reply {"error": "..."} saying what you do see instead."""
+
+
+BOARD_LOCATOR_SUBSCRIPTION = """
+
+The board still is a file on disk; its path is in your instructions. Open it
+with the Read tool — that is the only way you get to see it. Your final
+message is the JSON box and nothing else; it is parsed, not read."""
+
+
+DIAGRAM_INSTRUCTION = """
+
+Diagrams, in detail. You draw them yourself — you are the one who knows what
+the lecture proves, and an arrow direction is a mathematical claim, not a
+typesetting choice.
+
+There are two kinds, and only the first needs the board. A diagram you are
+COMPOSING — because a square, a span, a lifting problem or an exact sequence
+reads better drawn than described, whether or not the lecturer drew it — you
+write straight from the mathematics: skip to step 4, and pass the objects you
+intend as `objects` so the check still catches one you meant to include and
+dropped. A diagram you are REPRODUCING off a board goes through all of it.
+Composing is a presentation decision and is encouraged; it is not licence to
+assert a map the lecture does not.
+
+For a diagram off a board:
+
+1. Ask the 'board-locator' subagent (via the Task tool) for the region of the
+   board still holding the diagram: give it the still's absolute path and a
+   short description of what to box. It returns a JSON box. It is cheap and
+   it only finds things; it does not read mathematics.
+2. Call crop_board with that box. You get the region back at full resolution
+   instead of the whole slate shrunk to fit, which is the difference between
+   being able to see an arrowhead and guessing at it. (If you already know
+   where the diagram is, skip step 1 and pass the box yourself. A crop cannot
+   add detail that is not in the frame, so cropping tighter and tighter past
+   the diagram buys nothing.)
+3. Before drawing anything, list what is in the crop: first every object,
+   then every arrow with its direction, its style (↪ hook, ↠ two heads,
+   dashed, dotted), its label and which side the label is on. This is not
+   ceremony, and it is not for you — you will pass this list to
+   check_diagram, which diffs it against what you actually drew. The mistake
+   that survives every other check is the object you never noticed, because
+   nothing in your own diagram points at its absence; a declared list is the
+   only thing that can point at it. So list what is ON THE BOARD, not what
+   you intend to draw. Take directions off the picture, not off what the
+   mathematics "ought" to say; if the two disagree, stop, because either you
+   misread an arrowhead or the passage you are writing is wrong. Resolve it
+   before drawing, and say how in a \todo if you are not certain.
+4. Write the tikzcd (objects and arrows) or tikzpicture (things genuinely
+   drawn: a space, a region, a covering, a sketch), and call check_diagram
+   with the board number, the `objects` you listed in step 3, and their
+   `arrows` if you have them. It compiles the snippet on its own — so a
+   broken diagram cannot take the whole course build down — refuses any
+   diagram that does not contain everything you said was on the board,
+   reports structural defects compiling does not catch, hands the render
+   back, and gives you a provenance comment. Expect to go round more than
+   once. One clean compile is not a match; compiling only means it is valid
+   TikZ. Put the provenance comment directly above the diagram in the notes,
+   so the drawing can always be checked against the board it came from.
+5. Reproduce the mathematics, not the photograph: same objects, arrows,
+   labels and directions, but laid out cleanly rather than where they
+   happened to fall on the slate. Do not drop a map that is drawn off in a
+   corner if the diagram exists in order to lift it.
+6. Then smell-test the finished diagram AS MATHEMATICS, forgetting the
+   photograph for a moment. Reading chalk fails in specific ways — an
+   arrowhead is a few strokes, a superscript is a smudge, an object off to
+   one side gets missed — and the mathematics is the one check the picture
+   cannot argue with. Ask: could every arrow possibly go between the objects
+   it connects? Do the composites compose? Does a lift point from the thing
+   being constructed towards the thing it maps into? Does a surjection run
+   from the big object onto the small one? Is an "op" or other variance
+   decoration consistent with how the functor is used elsewhere in the
+   lecture, or did it appear from nowhere? Does the diagram say the same
+   thing as the sentence you are about to put above it? If the mathematics
+   and your reading of the board disagree, you have misread an arrowhead —
+   look again at that arrow specifically, and if it is still not clear,
+   follow the mathematics and note the doubt in a \todo. A reversed arrow is
+   a false theorem drawn beautifully, and it will pass every check that only
+   looks at the picture.
+
+Never write a placeholder comment meaning to come back and insert a diagram
+later. Nothing is running in the background; by the time you stop there is no
+later, and a comment where a diagram should be compiles silently. If you
+genuinely cannot read a diagram off the board, write the content as prose and
+mark it with \todo — that is a much cheaper failure than a confident diagram
+with an arrow reversed."""
+
+
+_MEDIA_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}
+
+
+def _image_block(path: Path) -> dict | None:
+    """An image content block for the Messages API, or None if unreadable —
+    a missing snapshot must not abort a whole lecture."""
+    path = Path(path)
+    media_type = _MEDIA_TYPES.get(path.suffix.lower())
+    if not media_type:
+        return None
+    try:
+        data = base64.standard_b64encode(path.read_bytes()).decode("ascii")
+    except OSError as exc:
+        print(f"\nWarning: could not attach {path.name}: {exc}", file=sys.stderr)
+        return None
+    return {"type": "image",
+            "source": {"type": "base64", "media_type": media_type,
+                       "data": data}}
+
+
+def _board_by_id(ctx: NotesToolContext, want) -> dict | None:
+    try:
+        want = int(want)
+    except (TypeError, ValueError):
+        return None
+    return next((b for b in ctx.boards if b["id"] == want), None)
+
+
+def _locate_diagram_tool(ctx: NotesToolContext, frame_model: str) -> dict:
+    ids = ", ".join(str(b["id"]) for b in ctx.boards)
+    return {
+        "name": "locate_diagram",
+        "description": (
+            f"Ask a cheaper model ({frame_model}) where something is on a "
+            f"board still, and get that region back cropped at full "
+            f"resolution. Use it before drawing a diagram: the whole slate "
+            f"is downscaled to fit the vision ceiling, which leaves a chalk "
+            f"arrowhead a pixel or two wide, whereas the cropped region "
+            f"arrives un-shrunk. You draw the diagram yourself from the "
+            f"crop. Boards: {ids}."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "board": {"type": ["integer", "string"],
+                          "description": "Which board to look at."},
+                "find": {
+                    "type": "string",
+                    "description": (
+                        "What to box, in plain terms — 'the commutative "
+                        "diagram on the right-hand panel', 'the displayed "
+                        "formula under the word Proof'. The locator does not "
+                        "read mathematics; describe the thing by where and "
+                        "what it looks like."),
+                },
+            },
+            "required": ["board", "find"],
+        },
+    }
+
+
+def _locate(client, model: str, ctx: NotesToolContext, board: dict,
+            find: str) -> tuple[dict | None, str]:
+    """Cheap model → a fractional box on the board still."""
+    photo = _image_block(Path(board["path"]))
+    if photo is None:
+        return None, f"board {board['id']} has no readable still"
+    content = [{"type": "text", "text": f"Board {board['id']}:"}, photo,
+               {"type": "text", "text": f"Box this: {find}"}]
+    reply = client.messages.create(
+        model=model, max_tokens=1000, system=BOARD_LOCATOR_PROMPT,
+        messages=[{"role": "user", "content": content}])
+    ctx.usage.add_anthropic_response(model, reply.usage)
+    text = "".join(b.text for b in reply.content if b.type == "text")
+    return parse_box(text)
+
+
+def parse_box(text: str) -> tuple[dict | None, str]:
+    """The locator's JSON box out of whatever it actually replied with."""
+    match = re.search(r"\{[^{}]*\}", text or "", re.DOTALL)
+    if not match:
+        return None, (text or "").strip()[:200] or "no box returned"
+    try:
+        box = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None, match.group(0)[:200]
+    if box.get("error"):
+        return None, str(box["error"])[:200]
+    try:
+        out = {k: float(box[k]) for k in ("x", "y", "width", "height")}
+    except (KeyError, TypeError, ValueError):
+        return None, f"box missing x/y/width/height: {match.group(0)[:150]}"
+    out["note"] = str(box.get("note", ""))[:120]
+    return out, ""
+
+
 def _run_api(system_prompt: str, user_text: str, ctx: NotesToolContext,
              output_file: Path, model: str, frame_model: str,
-             max_tokens: int, wait_for_answers: bool) -> str:
+             max_tokens: int, wait_for_answers: bool,
+             images: list[tuple[Path, str]] | None = None) -> str:
     import anthropic
 
     client = anthropic.Anthropic()
@@ -549,6 +824,30 @@ def _run_api(system_prompt: str, user_text: str, ctx: NotesToolContext,
         text = "".join(b.text for b in reply.content if b.type == "text")
         return ToolResult(f"Frame report ({len(stamps)} frame(s)):\n{text}")
 
+    def locate_diagram(inp: dict) -> ToolResult:
+        board = _board_by_id(ctx, inp.get("board"))
+        if board is None:
+            have = ", ".join(str(b["id"]) for b in ctx.boards) or "none"
+            return ToolResult(f"Error: no board {inp.get('board')!r}. "
+                              f"Boards for this lecture: {have}.",
+                              is_error=True)
+        print(f"\n  [locate_diagram board {board['id']} → {frame_model}]",
+              end="", flush=True)
+        box, why = _locate(client, frame_model, ctx, board, inp["find"])
+        if box is None:
+            return ToolResult(
+                f"The locator could not box that: {why}\nCrop it yourself "
+                f"with crop_board if you can see where it is.", is_error=True)
+        # Straight on to the crop: the box on its own is of no use to anyone.
+        return build_handlers(ctx)["crop_board"]({
+            "board": board["id"], "x": box["x"], "y": box["y"],
+            "width": box["width"], "height": box["height"]})
+
+    if ctx.boards and ctx.diagrams_dir is not None:
+        handlers["locate_diagram"] = locate_diagram
+        extra_tools.append(_locate_diagram_tool(ctx, frame_model))
+        system_prompt = system_prompt + DIAGRAM_INSTRUCTION
+
     tools = build_tools(ctx) + extra_tools + [
         _write_notes_tool(output_file),
         {
@@ -579,16 +878,18 @@ def _run_api(system_prompt: str, user_text: str, ctx: NotesToolContext,
         handlers["analyze_frames"] = analyze_frames
         tools.append(_analyze_frames_tool(frame_model))
         system_prompt = system_prompt + FRAME_DELEGATION_API
-    # cache_control on the (large) initial user turn and the system prompt so
-    # the whole stable prefix is cached across tool-call rounds.
-    messages = [{
-        "role": "user",
-        "content": [{
-            "type": "text",
-            "text": user_text,
-            "cache_control": {"type": "ephemeral"},
-        }],
-    }]
+    content: list[dict] = []
+    for path, caption in images or []:
+        block = _image_block(path)
+        if block:                      # a caption, so a bare image is never
+            content.append({"type": "text", "text": caption})   # unattributed
+            content.append(block)
+    content.append({"type": "text", "text": user_text})
+    # cache_control on the last block of the (large) initial user turn and on
+    # the system prompt, so the whole stable prefix — images included — is
+    # cached across tool-call rounds.
+    content[-1]["cache_control"] = {"type": "ephemeral"}
+    messages = [{"role": "user", "content": content}]
 
     broker = ensure_broker(ctx)
     revision_rounds = 0
@@ -617,10 +918,14 @@ def _run_api(system_prompt: str, user_text: str, ctx: NotesToolContext,
         for block in response.content:
             if block.type == "text":
                 collected += block.text
+                if block.text.strip():
+                    ctx.log.event("say", text=block.text.strip())
             elif block.type in ("tool_use", "server_tool_use"):
                 line = _tool_line(block.name, block.input)
                 if line:
                     print(line, flush=True)
+                if block.name not in handlers:   # ours are logged in-handler
+                    ctx.log.tool(block.name, block.input)
 
         # Execute any tool calls present, regardless of stop_reason (a
         # max_tokens-truncated turn may still carry complete tool_use blocks).
@@ -799,6 +1104,31 @@ def _run_subscription(system_prompt: str, user_text: str,
     else:
         disallowed.append("Task")
 
+    if ctx.boards and ctx.diagrams_dir is not None:
+        # The cheap model only finds things. Reading a diagram off a board is
+        # a mathematical judgement — an arrow direction is a claim, not a
+        # typesetting choice — and measurement said the cheap model gets it
+        # wrong even when magnified. So the main model draws, and this one
+        # answers the single question it can answer reliably: where is it.
+        agents = dict(agents or {})
+        agents["board-locator"] = AgentDefinition(
+            description=(
+                "Finds a region on a board photograph. Give it the still's "
+                "path and a description of what to box; it returns a JSON "
+                "box {x, y, width, height} in fractions of the image. It "
+                "does not read mathematics and does not draw."
+            ),
+            prompt=BOARD_LOCATOR_PROMPT + BOARD_LOCATOR_SUBSCRIPTION,
+            tools=["mcp__notes__crop_board", "Read"],
+            mcpServers=["notes"],
+            model=frame_model,
+        )
+        if "Task" not in allowed:
+            allowed.append("Task")
+        if "Task" in disallowed:
+            disallowed.remove("Task")
+        system_prompt = system_prompt + DIAGRAM_INSTRUCTION
+
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         mcp_servers={"notes": server},
@@ -825,10 +1155,15 @@ def _run_subscription(system_prompt: str, user_text: str,
                             parts.append(block.text)
                             if block.text.strip():
                                 print(block.text.strip(), flush=True)
+                                ctx.log.event("say", text=block.text.strip())
                         elif isinstance(block, ToolUseBlock):
                             line = _tool_line(block.name, block.input)
                             if line:
                                 print(line, flush=True)
+                            # Native tools (Read/Edit/WebSearch) never reach
+                            # our handlers, so record them here.
+                            if not block.name.startswith("mcp__notes__"):
+                                ctx.log.tool(block.name, block.input)
                 elif isinstance(message, ResultMessage):
                     final_result[0] = message
                     if message.is_error:

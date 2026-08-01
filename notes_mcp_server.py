@@ -71,6 +71,15 @@ def main() -> None:
     def get_user_answers() -> str:
         return _text(handlers["get_user_answers"]({}))
 
+    @server.tool(name="search_document",
+                 description=specs["search_document"]["description"])
+    def search_document(path: str, pattern: str, context: int = 2,
+                        max_matches: int = 30) -> str:
+        return _text(handlers["search_document"]({
+            "path": path, "pattern": pattern,
+            "context": context, "max_matches": max_matches,
+        }))
+
     @server.tool(name="view_pdf_page",
                  description=specs["view_pdf_page"]["description"])
     def view_pdf_page(path: str, page: int) -> str:

@@ -69,7 +69,7 @@ def _title_words(title: str) -> list[str]:
 
 
 def _last_name(author: str) -> str:
-    """Surname of the first author ('Scholze, Peter' / 'Peter Scholze' /
+    """Surname of the first author ('Ostrand, Marek' / 'Marek Ostrand' /
     'A and B' all give the first author's surname)."""
     first = re.split(r"\s+and\s+|;", author.strip())[0].strip()
     if "," in first:
@@ -143,6 +143,30 @@ def fetch_bibtex(url_or_id: str, title: str | None = None,
     return _online_entry(url or url_or_id.strip(), title, author, year)
 
 
+REPLACEMENT = "�"
+
+
+def sanitize_entry(entry: str) -> tuple[str, bool]:
+    """Make a fetched entry safe to compile. Returns (entry, was_mojibake).
+
+    Publisher metadata is sometimes already corrupt at the source — Crossref
+    serves Nöbeling as 'N\\ufffdbeling', replacement character and all — and a
+    U+FFFD in the .bib is a hard LaTeX error ("Unicode character ... not set
+    up for use with LaTeX") that takes the whole document down. We cannot
+    recover the intended letter, so substitute a character that compiles and
+    tell the user, rather than silently shipping a build-breaking file."""
+    if REPLACEMENT not in entry:
+        return entry, False
+    return entry.replace(REPLACEMENT, "?"), True
+
+
+def _ascii_key(key: str) -> str:
+    """Cite keys should be plain ASCII: they are typed by hand into \\cite{}
+    and passed between biber and LaTeX."""
+    cleaned = re.sub(r"[^\w:-]", "", key, flags=re.ASCII)
+    return cleaned or "reference"
+
+
 def existing_key(bib_file: Path, url_or_id: str) -> str | None:
     """The cite key already assigned to this source, if any."""
     if not bib_file.exists():
@@ -178,7 +202,12 @@ def cite(bib_file: Path, url_or_id: str, title: str | None = None,
         return key, False
 
     entry = fetch_bibtex(url_or_id, title, author, year)
+    entry, mojibake = sanitize_entry(entry)
     key = entry_key(entry) or _slug_key(title or url_or_id)
+    ascii_key = _ascii_key(key)
+    if ascii_key != key:
+        entry = entry.replace(key, ascii_key, 1)
+        key = ascii_key
     bib_file.parent.mkdir(parents=True, exist_ok=True)
     text = bib_file.read_text() if bib_file.exists() else ""
     unique = _unique_key(text, key)
@@ -186,11 +215,72 @@ def cite(bib_file: Path, url_or_id: str, title: str | None = None,
         entry = entry.replace(key, unique, 1)
         key = unique
 
+    note = ""
+    if mojibake:
+        note = (f"% FIXME: the publisher's own metadata for this entry is "
+                f"corrupt (it contained U+FFFD); '?' stands in for character(s)"
+                f" that could not be recovered. Correct by hand.\n")
+        print(f"  Warning: upstream metadata for {url_or_id} is corrupt — "
+              f"unrecoverable character(s) replaced with '?' in "
+              f"\\cite{{{key}}}; fix the entry by hand.")
     with open(bib_file, "a") as f:
         if text and not text.endswith("\n"):
             f.write("\n")
-        f.write(f"\n% source: {source_key(url_or_id)}\n{entry}")
+        f.write(f"\n% source: {source_key(url_or_id)}\n{note}{entry}")
     return key, True
+
+
+def _field(entry: str, name: str) -> str:
+    """One BibTeX field value, tolerating nested braces (author={N{\\"o}beling})
+    and unbraced values (year=1968)."""
+    m = re.search(rf"\b{name}\s*=\s*", entry, re.I)
+    if not m:
+        return ""
+    i = m.end()
+    if i >= len(entry):
+        return ""
+    if entry[i] == "{":
+        depth, start = 0, i + 1
+        for j in range(i, len(entry)):
+            if entry[j] == "{":
+                depth += 1
+            elif entry[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return entry[start:j]
+        return entry[start:]
+    if entry[i] == '"':
+        j = entry.find('"', i + 1)
+        return entry[i + 1:j] if j != -1 else entry[i + 1:]
+    m2 = re.match(r"[^,}\s]+", entry[i:])
+    return m2.group(0) if m2 else ""
+
+
+def _clean(value: str) -> str:
+    return re.sub(r"\s+", " ", value.replace("{", "").replace("}", "")).strip()
+
+
+def list_entries(bib_file: Path) -> list[dict]:
+    """Every entry as {key, author, title, year} — so an agent can be shown
+    what is already cited instead of re-deriving identifiers it already has."""
+    if not bib_file.exists():
+        return []
+    text = bib_file.read_text()
+    out = []
+    for chunk in re.split(r"\n(?=@)", text):
+        chunk = chunk.strip()
+        if not chunk.startswith("@"):
+            continue
+        key = entry_key(chunk)
+        if not key:
+            continue
+        out.append({
+            "key": key,
+            "author": _clean(_field(chunk, "author")),
+            "title": _clean(_field(chunk, "title")),
+            "year": _clean(_field(chunk, "year")),
+        })
+    return out
 
 
 def has_entries(bib_file: Path) -> bool:

@@ -40,7 +40,9 @@ Options:
   --frame-model MODEL   Cheaper model that reads video frames for the main
                         model (default: haiku on the Claude backends)
   --answer SLUG         Answer questions left open by an earlier run of
-                        lecture SLUG and revise that section in place
+                        lecture SLUG, and its \todo markers, then revise that
+                        section in place. Answering a \todo is optional —
+                        press Enter to leave it for the model to sweep
   --answer-all          Same, for every lecture with open questions or todos
   --latex-fix-rounds N  Rounds of model-driven repair when the assembled
                         document fails to compile (default: 2; 0 disables)
@@ -57,15 +59,22 @@ from pathlib import Path
 # Import helpers from sibling modules
 sys.path.insert(0, str(Path(__file__).parent))
 from claude_backend import (BACKENDS, collect_followup_answers, count_todos,
-                            open_question_count, questions_file_for, run_agent)
+                            mark_answers_applied, open_question_count,
+                            questions_file_for, run_agent)
 from ingest import (download_video, expand_playlist, extract_audio, is_url,
                     resolve_language, resolve_whisper_model, slug,
                     transcribe_batch, unique_lecture_dir)
 from fetch import describe_assets, fetch_reference, load_cached_reference
-from bibliography import has_entries
+from agent_log import summarize
+from bibliography import has_entries, list_entries
+from style_extract import extract as extract_style
+from boards import analyse
+from lecturer import (ATTRIBUTION_INSTRUCTION, lecturer_note,
+                      resolve as resolve_lecturers)
 from latex_check import LatexError, check_latex, print_errors, tokens_of
-from media import find_video, format_transcript
-from notes_tools import NotesToolContext
+from media import find_video, format_timestamp, format_transcript
+from notes_tools import (NotesToolContext, REGISTER_INSTRUCTION,
+                         ask_user_input, style_exemplar_block)
 from usage import Usage, format_usage
 
 # ---------------------------------------------------------------------------
@@ -82,6 +91,9 @@ PREAMBLE_TEMPLATE = r"""\documentclass[11pt]{article}
 \usepackage{parskip}
 \usepackage{enumitem}
 \usepackage[colorinlistoftodos,obeyDraft]{todonotes}
+%% Diagrams: tikz-cd for commutative diagrams, tikz for everything drawn
+\usepackage{tikz-cd}
+\usetikzlibrary{arrows.meta,decorations.pathmorphing,positioning,calc,patterns}
 %% Additions requested by Claude during note generation:
 %(extra_preamble)s
 %% hyperref before cleveref; colorlinks keeps the PDF clean
@@ -107,6 +119,11 @@ PREAMBLE_TEMPLATE = r"""\documentclass[11pt]{article}
 \declaretheorem[sibling=theorem,style=definition]{exercise}
 \declaretheorem[sibling=theorem,style=remark]{remark}
 \declaretheorem[sibling=theorem,style=remark]{notation}
+%% Theorem environments Claude asked for. These land after the built-in ones
+%% because they routinely say sibling=theorem or numberlike=theorem, and
+%% thmtools resolves that at declaration time — declared earlier they fail
+%% with "No counter 'theorem' defined".
+%(extra_theorems)s
 
 \title{%(title)s}
 \date{}
@@ -124,6 +141,8 @@ BIB_PREAMBLE = ("%% biblatex loads after hyperref; the running bibliography\n"
                 "\\addbibresource{%s}")
 BIB_PRINT = "\\printbibliography[heading=bibintoc]"
 BIB_FILENAME = "references.bib"
+BOARDS_SUBDIR = "boards"
+DIAGRAMS_SUBDIR = "diagrams"
 
 # ---------------------------------------------------------------------------
 # System prompt for the note-writing step
@@ -210,6 +229,16 @@ Rules:
   remark, notation.
   Note: hyperref and cleveref are loaded last and must stay last — additions
   go before them, so do not re-add either of those packages.
+  When a macro's expansion ends in a superscript or subscript, wrap the whole
+  body in braces: \newcommand{\Gm}{{\mathbb{G}_{m}}}, not
+  \newcommand{\Gm}{\mathbb{G}_{m}}; \newcommand{\ur}[1]{{#1^{\triangleright}}},
+  not \newcommand{\ur}[1]{#1^{\triangleright}}. Unbraced, the first call site
+  that attaches its own script — \Gm_{A}, \MBerk^{\mathrm{na}}, \ur A' —
+  is a "Double subscript"/"Double superscript" error, and the error surfaces
+  in whichever lecture happens to write it rather than in the definition.
+  Measured over this course: ten of forty-six macros had this shape and three
+  separate lectures hit it, each patching its own call sites one at a time
+  while the definition stayed broken for everyone else.
 - Cite sources with the cite_reference tool: give it an arXiv ID, DOI, or
   URL and it returns a key for \cite{key}, adding the entry to the course's
   shared bibliography (safe to call again for the same source). For arXiv
@@ -233,10 +262,43 @@ Rules:
   \todo{} over silently guessing; it lets the human reviewer find and fix
   uncertain spots in the compiled PDF. (todonotes is already loaded — do not
   add it via add_to_preamble.)
+- Draw what was drawn. A diagram the lecturer put on the board is part of the
+  mathematics, not decoration, and prose is a poor substitute for it: render
+  commutative diagrams with tikz-cd (\begin{tikzcd}), and anything else
+  informative that was drawn — a picture of a space, a filtration, a covering,
+  a sketch that carries an idea — with tikz. Both are already loaded; do not
+  add them via add_to_preamble. Crop the board to the diagram before you read
+  it, and compile-check what you write; the instructions below say how.
+  Reproduce the lecturer's diagram, not an idealised one, and do not invent
+  arrows, objects or labels you cannot see. A purely decorative drawing (an
+  underline, a box round a word) is not worth drawing.
+- Draw diagrams the lecturer did not draw, wherever one would make the
+  mathematics clearer. Whether something was drawn on the slate is an
+  accident of the lecture; whether it reads better as a diagram is a question
+  about the notes. A square that commutes, a span or cospan, a lifting
+  problem, a factorisation, a short exact sequence, a tower of maps — all of
+  these are clearer as a diagram than as a sentence with arrows in it, even
+  when the lecturer said them aloud and wrote nothing. The mathematics must
+  still be exactly what the lecture asserts: composing a diagram is a
+  decision about presentation, never a licence to add a map the lecture does
+  not claim.
+- Use display mode freely, for emphasis and for structure. A definition worth
+  stating, an equation the argument turns on, a condition being checked —
+  put it on its own line. Reserve inline mathematics for things that read as
+  part of a sentence.
+- The point of both is that unbroken prose is hard to read, and these are
+  notes people will read at the pace of the mathematics rather than the pace
+  of English. Displayed formulas and diagrams give the eye somewhere to
+  land, mark what matters, and let a reader find a result again later. That
+  is how mathematical lecture notes are conventionally written, and it is
+  what your reader expects; a page that is a wall of text is harder to use
+  regardless of how good the sentences are.
 - Clean up speech disfluencies but preserve the mathematical content faithfully.
 - Write only valid LaTeX body content — no \documentclass, no \begin{document},
   no \end{document} — to the output file named in the task instructions. Do
   not put the LaTeX in your reply text."""
+
+SYSTEM_PROMPT += REGISTER_INSTRUCTION + ATTRIBUTION_INSTRUCTION
 
 # ---------------------------------------------------------------------------
 # Ingest: download/extract each lecture, then transcribe all pending at once
@@ -287,6 +349,28 @@ def prepare_lecture(source: str, output_root: Path,
             json.dump(meta, f, indent=2)
 
     return out_dir, meta
+
+
+def prepare_boards(lecture_dirs: list[Path], color: bool = False) -> None:
+    """Segment each lecture's video into board states (boards/boards.json).
+
+    On by default (--no-boards to skip): everything the lecturer wrote and
+    never said is in these stills, and a lecture written from the transcript
+    alone gets notation wrong. Skips lectures already done, and any without a
+    video — an audio-only source silently gets the old behaviour."""
+    todo = [d for d in lecture_dirs
+            if not (d / BOARDS_SUBDIR / "boards.json").exists()
+            and find_video(d) is not None]
+    if not todo:
+        print("Boards: nothing to segment (all done, or no videos).")
+        return
+    print(f"\n=== Segmenting boards for {len(todo)} lecture(s) ===")
+    for d in todo:
+        try:
+            analyse(find_video(d), d / BOARDS_SUBDIR, color=color,
+                    progress=lambda m: print(f"  {m.strip()}"))
+        except Exception as exc:
+            print(f"  Warning: board segmentation failed for {d.name}: {exc}")
 
 
 def transcribe_pending(pending: list[tuple[Path, dict, str]],
@@ -400,6 +484,35 @@ Look for exactly these, in order:
 6. ANACHRONISTIC OR WRONG CITATIONS. A cited work that postdates the lecture
    cannot be what the lecturer meant. Check names and attributions against
    the literature; you have web search and fetch.
+7. DIAGRAMS THAT DO NOT MAKE SENSE. A tikzcd in the file was either read off
+   a photograph of a blackboard or composed from the mathematics. Both go
+   wrong in ways prose does not: reading chalk is unreliable in specific ways
+   — an arrowhead is a few strokes, a superscript is a smudge, an object off
+   to one side gets missed — and a composed diagram can quietly assert a map
+   the lecture never claimed. Either way, do not check by re-reading the
+   board; check as mathematics, which is what the photograph cannot argue
+   with and what the composition has to answer to. Take each diagram and ask:
+   - Does every arrow have a source and target it could possibly go between?
+     A map into a category's opposite, a lift pointing away from the thing
+     being lifted, a surjection running from the small object onto the large
+     one, an inclusion pointing outwards — each of these is what a misread
+     arrowhead looks like from the inside.
+   - Do composites compose? If two arrows are meant to commute with a third,
+     the types have to line up; when they do not, one arrow is reversed.
+   - Does the diagram agree with the prose beside it? A paragraph saying
+     "S_n surjects onto M_n" above a diagram drawing M_n -> S_n is the most
+     reliable signal there is, and one of the two is wrong.
+   - Is a variance decoration (an op, a contravariant hom) consistent with
+     how the functor is used? An "op" that appears nowhere in the surrounding
+     text is more likely a misread than a real one.
+   - Is an object referred to in the text but absent from the diagram? Things
+     dropped in the reading leave that trace and nothing else.
+   - Does the lecture actually claim every map drawn? A composed diagram is a
+     presentation of what was said, and an arrow added to make the picture
+     look complete is an invented theorem.
+   Where the mathematics settles it, fix the diagram. Where it does not, add
+   a \todo naming the arrow you doubt. A diagram is a mathematical assertion:
+   a reversed arrow is a false theorem drawn beautifully.
 
 Then fix what you found, editing the file in place:
 - Fix anything you are confident is wrong, with the smallest edit that makes
@@ -409,9 +522,363 @@ Then fix what you found, editing the file in place:
   \todo{...} saying precisely what you doubt. Do not assert and flag: if the
   claim may be false, weaken the claim.
 - Preserve every \label{} — later lectures cite them.
+- Correct how the notes name the lecturer, if they get it wrong: a first name,
+  "the speaker", "our lecturer", or a name where the task says none is on
+  record. That is a word-level edit, not a licence to rewrite the prose around
+  it. Attributing something to the wrong person, on the other hand, belongs
+  under UNSUPPORTED ADDITIONS above.
 
 Finally, reply with a short report: one line per change made, and one line
 per doubt you flagged. If the notes are clean, say so; do not invent work."""
+
+VERIFY_PROMPT += ATTRIBUTION_INSTRUCTION
+
+
+def _section_title(body: str) -> str:
+    """The \\section{...} heading of a lecture body (braces may nest)."""
+    m = re.search(r"\\section\*?\s*\{", body)
+    if not m:
+        return ""
+    depth, start = 0, m.end()
+    for j in range(m.end() - 1, len(body)):
+        if body[j] == "{":
+            depth += 1
+        elif body[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return re.sub(r"\s+", " ", body[start:j]).strip()
+    return ""
+
+
+def load_boards(lecture_dir: Path) -> list[dict]:
+    """The board records written by `--boards`, or [] if never segmented."""
+    path = Path(lecture_dir) / BOARDS_SUBDIR / "boards.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    out = []
+    for b in data.get("boards", []):
+        if b.get("image") and (path.parent / b["image"]).exists():
+            b = dict(b, path=(path.parent / b["image"]).resolve())
+            out.append(b)
+    return out
+
+
+def _spans(board: dict) -> str:
+    return ", ".join(f"{format_timestamp(a)}–{format_timestamp(b)}"
+                     for a, b in board["intervals"])
+
+
+def board_index(boards: list[dict], attached: bool = False) -> str:
+    """The lecture's boards, with when each was up and where its still is.
+
+    The transcript carries only what was said; every "this", "here" and
+    "that map" in it points at something that was written and never spoken.
+    These stills are the other half of the lecture, so they are listed up
+    front rather than left for the model to discover.
+
+    With attached=True the images are already in the message and the listing
+    is just the key to them; otherwise the paths are the only way in and the
+    model has to open them itself."""
+    if not boards:
+        return ""
+    rows = []
+    for b in boards:
+        note = f" (returned to; {b['revisits'] + 1} visits)" if b["revisits"] else ""
+        rows.append(f"  Board {b['id']:>2}: {_spans(b)}{note}\n"
+                    f"    {b['path']}\n")
+    how = (
+        "The stills are attached above, in this order.\n\n" if attached else
+        f"Open all {len(boards)} stills by path with your image-viewing tool "
+        f"before you start writing, in order, and go back to the relevant one "
+        f"as you write each part. Read every one, including boards that look "
+        f"like recap: skipping any is a decision you cannot make before you "
+        f"have seen it. This is not optional and not a fallback — a lecture "
+        f"written from the transcript alone will be wrong about notation.\n\n"
+        f"Read them YOURSELF. Do not hand batches of boards to subagents to "
+        f"transcribe for you. Measured over a full course: write passes that "
+        f"dispatched parallel board-reading subagents failed outright a third "
+        f"of the time — the turn ended with narration in place of the notes "
+        f"and the lecture was lost — while every pass that read the stills "
+        f"directly succeeded. It also costs you the diagrams: prose describing "
+        f"a board is not something you can draw a commutative diagram from, "
+        f"and the lecture that was rewritten without subagents produced three "
+        f"diagrams where the delegated attempt produced one. Yes, the images "
+        f"cost tokens. Spend them. (The one exception is the small "
+        f"'board-locator' call described below, which finds a region and reads "
+        f"nothing.)\n\n"
+    )
+    return (
+        "**Boards.** The blackboard was photographed at every distinct state. "
+        "Each still is that board at its most complete, with the lecturer "
+        "removed, so it shows everything ever written on it — including, for "
+        "a board still being filled at a given moment, writing that comes "
+        "later than the transcript line you are reading. The exact form of a "
+        "definition, an index, a diagram or a piece of notation is usually on "
+        "the board and not in the words. Where board and transcript disagree "
+        "about a symbol, prefer the board: the transcript is a guess at "
+        "speech, and it mangles notation that was never spoken aloud. A board "
+        "listed with several visits was returned to later.\n\n"
+        + how + "".join(rows) + "\n"
+    )
+
+
+_PLACEHOLDERS = (
+    # A SHOUTED_TOKEN on a comment line: DIAGRAM_PLACEHOLDER, TODO, FIXME.
+    # Case-sensitive on purpose — "% Additions requested by Claude" is an
+    # ordinary comment, and ignoring case would swallow it.
+    re.compile(r"^[ \t]*%+[ \t]*(?:[A-Z][A-Z0-9_]{3,}\b|TODO|FIXME|XXX)"
+               r"[^\n]*$", re.MULTILINE),
+    # Or the same intention spelled out in words.
+    re.compile(r"^[ \t]*%+[ \t]*(?:insert|fill|add|paste|put|draw)\b[^\n]*"
+               r"\b(?:here|later|below|to follow|goes)\b[^\n]*$",
+               re.MULTILINE | re.IGNORECASE),
+)
+
+
+class SectionNotWritten(Exception):
+    """The agent finished without writing a lecture. Never cache this: a
+    cached stub is indistinguishable from a real lecture on the next run, and
+    the course silently loses a chapter."""
+
+
+_MIN_SECTION_CHARS = 4000
+_NARRATION = re.compile(r"^\s*(?:I'll|I will|Let me|I'm going to|First,? I|"
+                        r"I need to|I've|I have launched|Now I)", re.I)
+_ENVIRONMENTS = re.compile(
+    r"\\begin\{(?:theorem|lemma|proposition|corollary|definition|example"
+    r"|exercise|remark|notation|proof|equation|align|tikzcd)\}")
+
+
+def looks_like_section(text: str) -> tuple[bool, str]:
+    """Is this a lecture section, or the agent talking to itself?
+
+    Lecture 7 of a full run was stored as 826 bytes ending "I'll wait for the
+    subagents to complete before continuing." The agent had dispatched five
+    board readers, treated the calls as asynchronous, and ended its turn; the
+    pipeline saw a written file, cached it, and moved on to lecture 8. Nothing
+    warned, and the lecture was simply gone from the course.
+
+    So the written file has to be checked for being a lecture at all. These
+    thresholds are deliberately crude — a real section runs to tens of
+    kilobytes with dozens of environments, so anything tripping them is
+    broken rather than merely terse, and the check costs nothing."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False, "the file is empty"
+    if _NARRATION.match(stripped):
+        return False, ("it begins as narration (\"" + stripped[:40].strip()
+                       + "…\"), not as LaTeX — the agent wrote its "
+                         "commentary here instead of the notes")
+    if "\\section{" not in stripped:
+        return False, "there is no \\section{...} heading"
+    if len(stripped) < _MIN_SECTION_CHARS:
+        return False, (f"it is only {len(stripped)} characters; a written-up "
+                       f"lecture runs to tens of thousands")
+    envs = len(_ENVIRONMENTS.findall(stripped))
+    if envs < 3:
+        return False, (f"it contains {envs} theorem/equation environment(s); "
+                       f"a lecture has dozens")
+    return True, ""
+
+
+def report_placeholders(section_file: Path) -> list[str]:
+    """Comments left standing in for content the agent meant to come back to.
+
+    An agent that delegates a diagram and then narrates "I'll insert it once
+    it returns" ends its turn with a comment where the diagram should be —
+    which compiles perfectly happily and is invisible in the PDF, so nothing
+    downstream would ever notice."""
+    try:
+        text = Path(section_file).read_text()
+    except OSError:
+        return []
+    hits, seen = [], set()
+    for pattern in _PLACEHOLDERS:
+        for m in pattern.finditer(text):
+            line = m.group(0).strip()
+            if line not in seen:       # "% TODO: fill in … here" matches both
+                seen.add(line)
+                hits.append(line)
+    if hits:
+        print(f"\n    Warning: {len(hits)} placeholder comment(s) left in "
+              f"{Path(section_file).name} — content the agent meant to fill "
+              f"in and did not:")
+        for h in hits[:5]:
+            print(f"      {h[:100]}")
+    return hits
+
+
+_TODO_OPEN = re.compile(r"\\todo(?:\[[^\]]*\])?\s*\{")
+
+
+def _brace_group(text: str, start: int) -> tuple[str, int]:
+    """Contents of the brace group opening at `start`, and where it ends.
+
+    Brace-counting rather than a regex because a \\todo body routinely
+    contains braces of its own ({\\mathbb Z}, \\text{...}), and a
+    non-greedy \\todo\\{(.*?)\\} would stop at the first inner closer.
+    """
+    depth, i = 0, start
+    while i < len(text):
+        c = text[i]
+        if c == "{" and (i == start or text[i - 1] != "\\"):
+            depth += 1
+        elif c == "}" and text[i - 1] != "\\":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:i], i + 1
+        i += 1
+    return text[start + 1:], len(text)
+
+
+def todo_items(text: str) -> list[str]:
+    """The text inside each \\todo{...}, in document order."""
+    out, i = [], 0
+    while True:
+        m = _TODO_OPEN.search(text, i)
+        if not m:
+            return out
+        body, end = _brace_group(text, m.end() - 1)
+        out.append(" ".join(body.split()))
+        i = end
+
+
+def ask_todo_answers(todos: list[str], lecture_num: int) -> str | None:
+    """Put each \\todo to the user; return a block of the ones they answered.
+
+    A \\todo is the agent saying it could not resolve something — which is
+    the same kind of gap as an open question, and the user is the one who
+    can close it. Before this they were only ever swept by the model, so
+    --answer-all offered no way to answer them however many there were.
+
+    Answering is optional: an empty reply leaves the marker for the model to
+    sweep as before. Non-interactive runs collect nothing (ask_user_input
+    returns "" with no terminal available) and behave exactly as they did.
+    """
+    if not todos:
+        return None
+    print(f"\n  {len(todos)} \\todo marker(s) in Lecture {lecture_num}. "
+          f"Answer any you can; press Enter to leave one to the model.",
+          flush=True)
+    answered = []
+    for i, todo in enumerate(todos, 1):
+        shown = todo if len(todo) <= 300 else todo[:300] + "…"
+        print(f"\n  [\\todo {i}/{len(todos)}] {shown}", flush=True)
+        reply = ask_user_input("  Your answer (Enter to skip): ")
+        if reply is None:          # prompt cancelled — stop asking
+            break
+        if reply.strip():
+            answered.append((todo, reply.strip()))
+    if not answered:
+        return None
+    return "\n\n".join(f"\\todo{{{todo}}}\n  → {ans}" for todo, ans in answered)
+
+
+def report_unread_boards(ctx, boards: list[dict],
+                         role: str = "write") -> list[int]:
+    """Which stills the agent was given and never opened.
+
+    Only meaningful where the images are read by path (the subscription and
+    codex backends); on the api backend they are in the prompt and there is
+    nothing to open. Silent when nothing was skipped.
+
+    The wording has to follow the role, or it says something false. A writer
+    that skipped a board really did reconstruct it from audio, which is worth
+    a warning. A *checker* is told it may consult the boards, not that it must
+    read all of them, and it opens the handful bearing on the claims it
+    doubts — printing the writer's warning there implies the stills went
+    unread when the writing pass had already read every one."""
+    seen = getattr(getattr(ctx, "log", None), "boards_seen", None)
+    if not boards or not seen:
+        return []
+    missed = [b["id"] for b in boards if b["id"] not in seen]
+    if not missed:
+        return []
+    if role == "write":
+        print(f"\n    Warning: {len(missed)} of {len(boards)} board stills "
+              f"were never opened: {', '.join(map(str, missed))}. Anything "
+              f"written only on those boards was reconstructed from audio.")
+    else:
+        print(f"\n    ({len(seen)} of {len(boards)} board stills opened while "
+              f"checking: {', '.join(map(str, sorted(seen)))} — the rest were "
+              f"checked against the transcript alone.)")
+    return missed
+
+
+def board_marks(boards: list[dict]) -> list[tuple[float, str]]:
+    """Transcript interleaves: which board is up, at the moment it goes up."""
+    marks = []
+    for b in boards:
+        for n, (start, _end) in enumerate(b["intervals"]):
+            again = " again" if n else ""
+            marks.append((start, f"[{format_timestamp(start)}] "
+                                 f"=== board {b['id']} up{again}: {b['path']} ==="))
+    return marks
+
+
+def lecture_index(output_root: Path, state: dict,
+                  exclude_slug: str | None = None) -> str:
+    """An index of the course's other lectures, for agents that revise or
+    check a single section.
+
+    They can already read these files, but were never told what is there —
+    so a question or a fix that turns on what an earlier lecture actually
+    said had nothing to work from. Full summaries would be hundreds of
+    kilobytes across a long course, so this lists titles and paths and lets
+    the agent open what it needs (the summary for a digest, the section for
+    the exact statement or label)."""
+    rows = []
+    for slug in ordered_slugs(state):
+        if slug == exclude_slug:
+            continue
+        sec = state["sections"][slug]
+        num = sec["lecture_num"]
+        title = _section_title(sec.get("body", "")) or slug
+        # The heading already reads "Lecture N: ..." — don't say it twice.
+        title = re.sub(r"^Lecture\s+\d+\s*[::.-]\s*", "", title)
+        d = (output_root / slug).resolve()
+        rows.append(f"  Lecture {num}: {title}\n"
+                    f"    notes:   {d / 'section.tex'}\n"
+                    + (f"    summary: {d / 'summary.md'}\n"
+                       if (d / "summary.md").exists() else ""))
+    if not rows:
+        return ""
+    return (
+        "Other lectures in this course. Open these when what you are fixing "
+        "depends on an earlier lecture — an exact statement, a label you need "
+        "to \\cref, or notation established there. Read the summary for a "
+        "digest, the notes file for the precise wording. Do NOT open "
+        "course.tex: it is every lecture concatenated (about a megabyte) and "
+        "will be cut off before you reach what you wanted — use the "
+        "per-lecture files below, or search_document to find a label across "
+        "them:\n\n"
+        + "".join(rows) + "\n")
+
+
+def bibliography_index(bib_file: Path) -> str:
+    """What is already cited, so an agent reuses a key instead of re-deriving
+    the identifier (and re-searching the web) for a source already in."""
+    entries = list_entries(Path(bib_file))
+    if not entries:
+        return ""
+    rows = []
+    for e in entries:
+        who = e["author"].split(" and ")[0] if e["author"] else ""
+        if who and " and " in e["author"]:
+            who += " et al."
+        title = e["title"][:70] + ("…" if len(e["title"]) > 70 else "")
+        bits = " — ".join(x for x in (who, title) if x)
+        year = f" ({e['year']})" if e["year"] else ""
+        rows.append(f"  \\cite{{{e['key']}}}{' — ' if bits else ''}{bits}{year}")
+    return (
+        f"Already in the course bibliography ({len(entries)} entries). Cite "
+        f"any of these directly with the key shown — do NOT call "
+        f"cite_reference for them, and do not look them up again:\n"
+        + "\n".join(rows) + "\n\n")
 
 
 def lecture_provenance(meta: dict) -> str:
@@ -493,6 +960,8 @@ def generate_section(
     references: list[dict],
     refs_dir: Path,
     existing_preamble_additions: list[str],
+    style_exemplars: list | None = None,
+    lecturer: str | None = None,
     backend: str = "subscription",
     model: str | None = None,
     frame_model: str | None = None,
@@ -510,17 +979,21 @@ def generate_section(
     meta = data.get("metadata", {})
     title = meta.get("title", lecture_dir.name)
     total_duration = segments[-1]["end"] if segments else 0
-    transcript_text = format_transcript(segments)
+    boards = load_boards(lecture_dir)
+    transcript_text = format_transcript(segments, board_marks(boards))
 
     video_path = find_video(lecture_dir)
     ctx = NotesToolContext(
         refs_dir=refs_dir,
         video_path=video_path,
         total_duration=total_duration,
+        transcript_path=lecture_dir / "transcript.json",
         enable_preamble=True,
         existing_preamble=list(existing_preamble_additions),
         read_roots=[refs_dir.parent.resolve()],
         bib_file=refs_dir.parent / BIB_FILENAME,
+        boards=boards,
+        diagrams_dir=lecture_dir / DIAGRAMS_SUBDIR,
     )
 
     # Build the user message
@@ -553,26 +1026,66 @@ def generate_section(
     user_text = (
         f"{context_block}"
         f"{refs_block}"
+        f"{style_exemplar_block(style_exemplars)}"
+        f"{bibliography_index(ctx.bib_file)}"
         f"Now write **Lecture {lecture_num}** (source title: \"{title}\").\n\n"
+        f"{lecturer_note(lecturer)}"
         f"{lecture_provenance(meta)}"
         f"{corrections_note}"
+        f"{board_index(boards, attached=backend == 'api')}"
         f"**Transcript:**\n\n{transcript_text}"
     )
 
-    section_text = run_agent(
-        system_prompt=SYSTEM_PROMPT,
-        user_text=user_text,
-        ctx=ctx,
-        output_file=lecture_dir / "section.tex",
-        backend=backend,
-        model=model,
-        frame_model=frame_model,
-        wait_for_answers=wait,
-        summary_file=lecture_dir / "summary.md",
-    )
+    def write(extra: str = "", role: str = "write") -> str:
+        return run_agent(
+            system_prompt=SYSTEM_PROMPT,
+            user_text=user_text + extra,
+            ctx=ctx,
+            output_file=lecture_dir / "section.tex",
+            backend=backend,
+            model=model,
+            frame_model=frame_model,
+            wait_for_answers=wait,
+            summary_file=lecture_dir / "summary.md",
+            images=[(b["path"], f"Board {b['id']} ({_spans(b)})")
+                    for b in boards],
+            role=role, log_dir=refs_dir.parent / LOG_SUBDIR,
+        )
+
+    section_text = write()
+    ok, why = looks_like_section(section_text)
+    if not ok:
+        # One retry, naming the mistake. The observed failure was the agent
+        # ending its turn while "waiting" for subagents it had dispatched, so
+        # say plainly that there is nothing to wait for.
+        print(f"\n    Warning: the written section is not a lecture — {why}. "
+              f"Retrying once.")
+        section_text = write(
+            "\n\n---\n**Your previous attempt did not write the notes.** The "
+            f"file held only your own commentary: {why}. Note that every tool "
+            "and subagent call returns its result to you inside this same "
+            "turn — there is nothing to wait for and no later turn in which "
+            "to continue, so never end your reply pending a result. Dispatch "
+            "what you need, use the results as they come back, and write the "
+            "complete LaTeX body to the output file before you finish.",
+            role="write-retry")
+        ok, why = looks_like_section(section_text)
+        if not ok:
+            print(f"    Warning: the retry also failed — {why}. This lecture "
+                  f"will NOT be cached; rerun to try again.")
+            raise SectionNotWritten(f"{lecture_dir.name}: {why}")
 
     if ctx.frame_requests:
         print(f"\n    ({ctx.frame_requests} frame(s) fetched)", end="")
+    report_unread_boards(ctx, boards)
+    report_placeholders(lecture_dir / "section.tex")
+    # Questions are asked *during* the write pass, and the agent has already
+    # used the answers in the text it just wrote — so they are applied, and
+    # must be recorded as such. Without this every answer given while writing
+    # stays applied=False for ever, and each later --answer/--answer-all
+    # announces it as "an answer from an earlier run that was never applied"
+    # and re-delivers it to the model, on every run, indefinitely.
+    mark_answers_applied(ctx, lecture_dir / "section.tex")
     return section_text, ctx.new_corrections, ctx.new_preamble_additions, ctx.usage
 
 
@@ -592,7 +1105,8 @@ def load_state(output_root: Path) -> dict:
             "lecture_num": int,
             "body": str          # the LaTeX body written for this lecture
           }
-        }
+        },
+        "lecturers": {"<lecture-dir-name>": str}   # who spoke, as answered
       }
     Sections are ordered by lecture_num, but stored as a dict keyed by the
     lecture directory name so we can look up whether a lecture is already done.
@@ -602,7 +1116,7 @@ def load_state(output_root: Path) -> dict:
         with open(path) as f:
             return json.load(f)
     return {"title": None, "sections": {}, "corrections": {}, "references": [],
-            "preamble_additions": []}
+            "preamble_additions": [], "lecturers": {}}
 
 
 def save_state(output_root: Path, state: dict) -> None:
@@ -623,6 +1137,41 @@ def current_body(output_root: Path, state: dict, slug: str) -> str:
     return state["sections"][slug]["body"]
 
 
+def course_preamble(title: str, state: dict,
+                    with_bib: bool) -> tuple[str, str]:
+    """(preamble, closing bibliography block) — shared by the single-file
+    build and the multi-file export so the two cannot drift apart."""
+    bib_preamble = BIB_PREAMBLE % BIB_FILENAME if with_bib else ""
+    early, late = split_preamble(state.get("preamble_additions", []))
+    preamble = PREAMBLE_TEMPLATE % {
+        "title": title,
+        "extra_preamble": "\n".join(early),
+        "extra_theorems": "\n".join(late),
+        "bibliography": bib_preamble,
+    }
+    return preamble, ("\n\n" + BIB_PRINT if with_bib else "")
+
+
+_LATE_PREAMBLE = re.compile(r"^\s*\\(?:declaretheorem|theoremstyle"
+                            r"|newtheorem|Crefname|crefname)\b")
+
+
+def split_preamble(additions: list) -> tuple[list, list]:
+    """(before hyperref, after the theorem block).
+
+    Two conflicting constraints. A \\usepackage has to load before hyperref,
+    which must be second-to-last with cleveref last. But a \\declaretheorem
+    that says sibling=theorem needs the built-in theorem environments to
+    exist already, and those are declared after cleveref. So the additions
+    are split rather than dropped in one place: packages and macros early,
+    theorem declarations and cross-reference names late."""
+    early, late = [], []
+    for entry in additions:
+        for line in str(entry).splitlines():
+            (late if _LATE_PREAMBLE.match(line) else early).append(line)
+    return early, late
+
+
 def render_document(title: str, body_parts: list[str], state: dict,
                     output_root: Path, output_tex: Path
                     ) -> tuple[str, list[tuple[int, int]]]:
@@ -635,19 +1184,12 @@ def render_document(title: str, body_parts: list[str], state: dict,
     lecture that wrote the offending source.
     """
     bib_src = output_root / BIB_FILENAME
-    bib_preamble = bib_print = ""
-    if has_entries(bib_src):
+    with_bib = has_entries(bib_src)
+    if with_bib:
         # biblatex resolves \addbibresource relative to the .tex file.
         if bib_src.resolve() != (output_tex.parent / BIB_FILENAME).resolve():
             shutil.copy2(bib_src, output_tex.parent / BIB_FILENAME)
-        bib_preamble = BIB_PREAMBLE % BIB_FILENAME
-        bib_print = "\n\n" + BIB_PRINT
-
-    preamble = PREAMBLE_TEMPLATE % {
-        "title": title,
-        "extra_preamble": "\n".join(state.get("preamble_additions", [])),
-        "bibliography": bib_preamble,
-    }
+    preamble, bib_print = course_preamble(title, state, with_bib)
 
     doc = preamble + "\n\n"
     spans: list[tuple[int, int]] = []
@@ -659,6 +1201,68 @@ def render_document(title: str, body_parts: list[str], state: dict,
             doc += "\n\n"
     doc += bib_print + "\n\n" + CLOSING + "\n"
     return doc, spans
+
+
+LECTURE_SUBDIR = "lectures"
+MAIN_FILENAME = "main.tex"
+LOG_SUBDIR = "logs"
+
+
+def _tex_stem(num: int, slug: str) -> str:
+    """A filename safe to hand to \\input: ASCII, no spaces, no underscores
+    (TeX would read one as a subscript in the argument)."""
+    safe = re.sub(r"[^a-z0-9-]+", "-", slug.lower()).strip("-") or "lecture"
+    return f"{num:02d}-{safe}"
+
+
+def export_project(output_root: Path, state: dict, dest: Path,
+                   slugs: list[str] | None = None,
+                   title: str | None = None) -> Path:
+    """Write the course as an editable multi-file LaTeX project:
+
+        dest/main.tex                 preamble, \\input lines, bibliography
+        dest/lectures/NN-<slug>.tex   one file per lecture, body only
+        dest/references.bib           the running bibliography (if non-empty)
+
+    Separate from the single assembled course.tex: this is the form you hand
+    to a co-author or put under version control, where a per-lecture diff is
+    worth more than one 200k-character file."""
+    if slugs is None:
+        slugs = ordered_slugs(state)
+    dest = Path(dest)
+    (dest / LECTURE_SUBDIR).mkdir(parents=True, exist_ok=True)
+    title = title or state.get("title") or "Lecture Notes"
+
+    bib_src = output_root / BIB_FILENAME
+    with_bib = has_entries(bib_src)
+    if with_bib:
+        shutil.copy2(bib_src, dest / BIB_FILENAME)
+
+    inputs, seen = [], set()
+    for slug in slugs:
+        num = state["sections"][slug]["lecture_num"]
+        stem = _tex_stem(num, slug)
+        while stem in seen:            # distinct slugs can sanitize alike
+            stem += "-b"
+        seen.add(stem)
+        body = current_body(output_root, state, slug).strip()
+        (dest / LECTURE_SUBDIR / f"{stem}.tex").write_text(body + "\n")
+        inputs.append(f"\\input{{{LECTURE_SUBDIR}/{stem}}}")
+
+    preamble, bib_print = course_preamble(title, state, with_bib)
+    header = (
+        "%% Generated by build_course.py --export. Edit the per-lecture files\n"
+        f"%% in {LECTURE_SUBDIR}/; regenerating overwrites them.\n"
+        "%% Build with:  latexmk -pdf main.tex\n")
+    (dest / MAIN_FILENAME).write_text(
+        header + preamble + "\n\n" + "\n".join(inputs)
+        + bib_print + "\n\n" + CLOSING + "\n")
+
+    save_state(output_root, state)
+    print(f"Exported {len(slugs)} lecture(s) to {dest}/: {MAIN_FILENAME}, "
+          f"{LECTURE_SUBDIR}/, "
+          + (f"{BIB_FILENAME}" if with_bib else "(no bibliography)"))
+    return dest / MAIN_FILENAME
 
 
 def merge_section_usage(state: dict, slug: str, usage: Usage) -> None:
@@ -820,7 +1424,8 @@ def _fix_preamble(output_root: Path, state: dict, errors: list[LatexError],
     print(f"\n[latex-fix → preamble] {len(errors)} error(s)", flush=True)
     text = run_agent(system_prompt=SYSTEM_PROMPT, user_text=user_text, ctx=ctx,
                      output_file=path, backend=backend, model=model,
-                     frame_model=frame_model, revise=True)
+                     frame_model=frame_model, revise=True,
+                     role="fix-preamble", log_dir=output_root / LOG_SUBDIR)
     run_usage.add(ctx.usage)
     cleaned = text.strip()
     if not cleaned:
@@ -842,6 +1447,29 @@ def _fix_preamble(output_root: Path, state: dict, errors: list[LatexError],
         junk.unlink(missing_ok=True)
 
 
+def double_script_note(errors: list[LatexError]) -> str:
+    """Extra guidance when a section reports a stacked sub/superscript.
+
+    "Double subscript" is almost never a defect of the line that reports it:
+    the macro's own definition ends in an unbraced script, so it breaks at
+    every call site that adds one. Left to itself the model braces the call
+    site in front of it — which fixes this lecture and leaves the definition
+    broken for the other twenty-three. That is exactly what happened on this
+    course, in three separate lectures, to \\Gm, \\MBerk and \\ur.
+    """
+    if not any("Double subscript" in e.message
+               or "Double superscript" in e.message for e in errors):
+        return ""
+    return (
+        "\nA \"Double subscript\"/\"Double superscript\" error usually means "
+        "the macro's definition already ends in a script — \\Gm expanding to "
+        "\\mathbb{G}_{m}, so \\Gm_{A} stacks two subscripts. Fix the "
+        "definition, not the call site: add a \\renewcommand with the whole "
+        "body braced (\\renewcommand{\\Gm}{{\\mathbb{G}_{m}}}) via "
+        "add_to_preamble, which repairs every lecture that uses it at once. "
+        "Only brace the call site if the definition is genuinely fine.\n")
+
+
 def _fix_section(output_root: Path, state: dict, slug: str,
                  errors: list[LatexError], span: tuple[int, int],
                  doc_lines: list[str], backend: str, model: str | None,
@@ -853,6 +1481,7 @@ def _fix_section(output_root: Path, state: dict, slug: str,
         refs_dir=output_root / "references",
         video_path=find_video(lecture_dir),
         total_duration=lecture_duration(lecture_dir),
+        transcript_path=lecture_dir / "transcript.json",
         enable_preamble=True,
         existing_preamble=list(state.get("preamble_additions", [])),
         read_roots=[output_root.resolve()],
@@ -863,14 +1492,18 @@ def _fix_section(output_root: Path, state: dict, slug: str,
         cite_note = (
             "\nAn undefined citation means the key is not in the "
             "bibliography. Either you invented the key — replace it with the "
-            "right one — or the source was never registered: call "
-            "cite_reference for it (with title, author and year for anything "
-            "that is not an arXiv ID or DOI) and use the key it returns.\n")
+            "right one from the list above — or the source was never "
+            "registered: call cite_reference for it (with title, author and "
+            "year for anything that is not an arXiv ID or DOI) and use the "
+            "key it returns.\n")
+    script_note = double_script_note(errors)
     user_text = (
         f"The assembled course document does not compile. These errors come "
         f"from your section, Lecture {num}, in `{section_file}`:\n\n"
         f"{_localize(errors, span, doc_lines)}\n"
-        f"{cite_note}\n"
+        f"{cite_note}"
+        f"{script_note}\n"
+        f"{bibliography_index(output_root / BIB_FILENAME) if any(e.citations for e in errors) else ''}"
         f"Read the file and fix them. Keep the mathematics exactly as it is — "
         f"you are correcting LaTeX, not rewriting content. Note that the "
         f"preamble is fixed and shared: if a macro or environment is genuinely "
@@ -883,7 +1516,8 @@ def _fix_section(output_root: Path, state: dict, slug: str,
     # lecture says, so the existing summary stays valid.
     body = run_agent(system_prompt=SYSTEM_PROMPT, user_text=user_text, ctx=ctx,
                      output_file=section_file, backend=backend, model=model,
-                     frame_model=frame_model, revise=True)
+                     frame_model=frame_model, revise=True,
+                     role="fix-latex", log_dir=output_root / LOG_SUBDIR)
     state["sections"][slug]["body"] = body.strip()
     merge_section_usage(state, slug, ctx.usage)
     run_usage.add(ctx.usage)
@@ -1044,6 +1678,7 @@ def propagate_revisions(output_root: Path, state: dict,
             refs_dir=output_root / "references",
             video_path=find_video(lecture_dir2),
             total_duration=lecture_duration(lecture_dir2),
+            transcript_path=lecture_dir2 / "transcript.json",
             enable_preamble=True,
             existing_preamble=list(state.get("preamble_additions", [])),
             read_roots=[output_root.resolve()],
@@ -1052,6 +1687,8 @@ def propagate_revisions(output_root: Path, state: dict,
         user_text = (
             f"{revised_list} of this series {'was' if len(relevant) == 1 else 'were'} "
             f"just revised in a follow-up:\n\n{changes_text}\n\n"
+            f"{lecture_index(output_root, state, slug2)}"
+            f"{bibliography_index(output_root / BIB_FILENAME)}"
             f"Your section is Lecture {num2}, in `{section_file2}`. Read it "
             f"and update anything affected by the changes above — material "
             f"inherited from those lectures (restated definitions, notation, "
@@ -1072,6 +1709,7 @@ def propagate_revisions(output_root: Path, state: dict,
             revise=True,
             wait_for_answers=wait,
             summary_file=lecture_dir2 / "summary.md",
+            role="propagate", log_dir=output_root / LOG_SUBDIR,
         )
         state["sections"][slug2]["body"] = body2.strip()
         merge_section_usage(state, slug2, ctx2.usage)
@@ -1088,39 +1726,74 @@ def propagate_revisions(output_root: Path, state: dict,
         save_state(output_root, state)
 
 
-def revise_lecture(output_root: Path, state: dict, slug: str,
-                   backend: str, model: str | None, frame_model: str | None,
-                   wait: bool, run_usage: Usage) -> tuple[str | None,
-                                                          dict[str, str]]:
-    """Re-ask this lecture's open questions and have the agent revise its
-    section in place (also sweeping remaining \\todo markers). Returns
-    (answers_block, new_corrections); (None, {}) if there was nothing to do."""
+def collect_lecture_answers(output_root: Path, state: dict, slug: str
+                            ) -> tuple[NotesToolContext, str | None, int,
+                                       str | None]:
+    """Ask the user this lecture's open questions and \\todo markers. No model
+    runs here.
+
+    Kept separate from revise_lecture so a whole-course follow-up can put
+    every question to the user in one sitting and only then start the models
+    — rather than making them wait at the terminal between lectures.
+
+    The context is handed back rather than rebuilt later because answering a
+    clarify question records a transcript correction on it, which the
+    revision and the propagation both need."""
     lecture_dir = output_root / slug
     section_file = ensure_section_file(output_root, state, slug)
-    total_duration = lecture_duration(lecture_dir)
-
     ctx = NotesToolContext(
         refs_dir=output_root / "references",
         video_path=find_video(lecture_dir),
-        total_duration=total_duration,
+        total_duration=lecture_duration(lecture_dir),
+        transcript_path=lecture_dir / "transcript.json",
         enable_preamble=True,
         existing_preamble=list(state.get("preamble_additions", [])),
         read_roots=[output_root.resolve()],
         bib_file=output_root / BIB_FILENAME,
+        boards=load_boards(lecture_dir),
+        diagrams_dir=lecture_dir / DIAGRAMS_SUBDIR,
     )
-
     answers_block = collect_followup_answers(ctx, section_file,
                                              lecture_segments(lecture_dir))
-    todos = count_todos(section_file.read_text())
-    if not answers_block and todos == 0:
+    body = section_file.read_text()
+    todos = count_todos(body)
+    todo_answers = ask_todo_answers(
+        todo_items(body), state["sections"][slug]["lecture_num"])
+    return ctx, answers_block, todos, todo_answers
+
+
+def revise_lecture(output_root: Path, state: dict, slug: str,
+                   backend: str, model: str | None, frame_model: str | None,
+                   wait: bool, run_usage: Usage, ctx: NotesToolContext,
+                   answers_block: str | None, todos: int,
+                   todo_answers: str | None = None
+                   ) -> tuple[str | None, dict[str, str]]:
+    """Have the agent revise this section in place, applying the answers
+    already collected and sweeping remaining \\todo markers. Returns
+    (answers_block, new_corrections); (None, {}) if there was nothing to do."""
+    lecture_dir = output_root / slug
+    section_file = ensure_section_file(output_root, state, slug)
+    if not answers_block and not todo_answers and todos == 0:
         print("No open questions and no \\todo markers — nothing to do.")
         return None, {}
 
+    boards = ctx.boards
     parts = [f"You previously wrote the LaTeX body for Lecture "
-             f"{state['sections'][slug]['lecture_num']} to `{section_file}`."]
+             f"{state['sections'][slug]['lecture_num']} to `{section_file}`.",
+             lecturer_note(state.get("lecturers", {}).get(slug)).rstrip(),
+             lecture_index(output_root, state, slug).rstrip(),
+             bibliography_index(output_root / BIB_FILENAME).rstrip(),
+             board_index(boards, attached=backend == "api").rstrip()]
+    parts = [p for p in parts if p]
     if answers_block:
         parts.append("The user has now answered previously open "
                      f"questions:\n\n{answers_block}")
+    if todo_answers:
+        parts.append(
+            "The user has answered some of the \\todo markers in the file. "
+            "Apply each answer and remove that marker; the answer is "
+            "authoritative, so do not second-guess it or re-flag the "
+            f"point:\n\n{todo_answers}")
     parts.append(
         f"The file currently contains {todos} \\todo marker(s). Read the "
         f"file, then: apply the answers above, and review each remaining "
@@ -1140,8 +1813,14 @@ def revise_lecture(output_root: Path, state: dict, slug: str,
         revise=True,
         wait_for_answers=wait,
         summary_file=lecture_dir / "summary.md",
+        images=[(b["path"], f"Board {b['id']} ({_spans(b)})") for b in boards],
+        role="revise", log_dir=output_root / LOG_SUBDIR,
     )
+    report_unread_boards(ctx, boards, role="revise")
+    report_placeholders(section_file)
 
+    # The notes now contain these answers; don't re-deliver them next run.
+    mark_answers_applied(ctx, section_file)
     state["sections"][slug]["body"] = section.strip()
     run_usage.add(ctx.usage)
     merge_section_usage(state, slug, ctx.usage)
@@ -1183,20 +1862,27 @@ def verify_lecture(output_root: Path, state: dict, slug: str, backend: str,
         refs_dir=output_root / "references",
         video_path=find_video(lecture_dir),
         total_duration=lecture_duration(lecture_dir),
+        transcript_path=lecture_dir / "transcript.json",
         enable_preamble=True,
         existing_preamble=list(state.get("preamble_additions", [])),
         read_roots=[output_root.resolve()],
         bib_file=output_root / BIB_FILENAME,
+        boards=load_boards(lecture_dir),
+        diagrams_dir=lecture_dir / DIAGRAMS_SUBDIR,
     )
+    boards = ctx.boards
     user_text = (
         f"Check the notes for **Lecture {num}** of this course, in "
         f"`{section_file}`.\n\n"
+        f"{lecturer_note(state.get('lecturers', {}).get(slug))}"
         f"{lecture_provenance(meta)}"
-        f"You may consult the video frames (to check anything read off the "
-        f"board) and the bibliography tools, and you may read the other "
-        f"lectures under {output_root.resolve()} if a cross-reference needs "
-        f"checking.\n\n"
-        f"**Transcript:**\n\n{format_transcript(segments)}"
+        f"You may consult the video frames to check anything read off the "
+        f"board.\n\n"
+        f"{lecture_index(output_root, state, slug)}"
+        f"{bibliography_index(output_root / BIB_FILENAME)}"
+        f"{board_index(boards, attached=backend == 'api')}"
+        f"**Transcript:**\n\n"
+        f"{format_transcript(segments, board_marks(boards))}"
     )
     print(f"\n[verify → Lecture {num} ({slug})]", flush=True)
     body = run_agent(
@@ -1209,7 +1895,11 @@ def verify_lecture(output_root: Path, state: dict, slug: str, backend: str,
         frame_model=frame_model,
         revise=True,
         summary_file=lecture_dir / "summary.md",
+        images=[(b["path"], f"Board {b['id']} ({_spans(b)})") for b in boards],
+        role="verify", log_dir=output_root / LOG_SUBDIR,
     )
+    report_unread_boards(ctx, boards, role="verify")
+    report_placeholders(section_file)
     state["sections"][slug]["body"] = body.strip()
     merge_section_usage(state, slug, ctx.usage)
     run_usage.add(ctx.usage)
@@ -1243,7 +1933,12 @@ def answer_lectures(output_root: Path, slugs: list[str] | None,
                     frame_model: str | None, wait: bool = False,
                     propagate: bool = True, fix_rounds: int = 0) -> None:
     """Follow-up run over one lecture (slugs=[slug]) or the whole course
-    (slugs=None): answer open questions, revise, propagate, reassemble."""
+    (slugs=None): answer open questions, revise, propagate, reassemble.
+
+    Questions for every lecture are put to the user first, in one sitting;
+    only then do the models start. Interleaving them would strand the user at
+    the terminal between lectures, waiting for one revision to finish before
+    being asked the next question."""
     state = load_state(output_root)
     if slugs is None:
         pending = pending_questions(output_root, state)
@@ -1267,14 +1962,42 @@ def answer_lectures(output_root: Path, slugs: list[str] | None,
                 sys.exit(f"No generated section for '{slug}'. Known: {known}")
 
     run_usage = Usage()
-    changes_by_num: dict[int, str] = {}
+
+    # Phase 1 — everything that needs you, up front.
+    collected = []
     for i, slug in enumerate(slugs, 1):
         num = state["sections"][slug]["lecture_num"]
         if len(slugs) > 1:
-            print(f"\n=== [{i}/{len(slugs)}] Lecture {num} ({slug}) ===")
+            print(f"\n=== Questions [{i}/{len(slugs)}]: "
+                  f"Lecture {num} ({slug}) ===")
+        ctx, answers_block, todos, todo_answers = collect_lecture_answers(
+            output_root, state, slug)
+        collected.append((slug, num, ctx, answers_block, todos, todo_answers))
+
+    # Indexed rather than star-unpacked: these rows have grown before, and a
+    # `for *_, block, todos in` silently reads the wrong fields when they do.
+    todo_total = sum(row[4] for row in collected)
+    answered = sum(1 for row in collected if row[3] or row[5])
+    if any(row[3] or row[4] or row[5] for row in collected):
+        if len(slugs) > 1:
+            print(f"\n=== All questions collected ({answered} lecture(s) with "
+                  f"answers, {todo_total} \\todo marker(s) to sweep) ===")
+        print("Running the models now. You can leave this unattended: any new "
+              "question raised during the revisions is queued, not waited on"
+              + (" (--wait overrides that)." if not wait else
+                 ", but --wait will block for it at the end.") + "\n",
+              flush=True)
+
+    # Phase 2 — unattended.
+    changes_by_num: dict[int, str] = {}
+    for i, (slug, num, ctx, answers_block, todos,
+            todo_answers) in enumerate(collected, 1):
+        if len(slugs) > 1:
+            print(f"\n=== [{i}/{len(slugs)}] Revising Lecture {num} "
+                  f"({slug}) ===")
         answers_block, new_corrections = revise_lecture(
             output_root, state, slug, backend, model, frame_model, wait,
-            run_usage)
+            run_usage, ctx, answers_block, todos, todo_answers)
         changes = describe_revision(num, answers_block, new_corrections)
         if changes:
             changes_by_num[num] = changes
@@ -1455,13 +2178,50 @@ def main():
                              "propagate the changes to later lectures, then "
                              "reassemble the course document.")
     parser.add_argument("--answer-all", action="store_true",
-                        help="Follow-up mode over the whole course: work "
-                             "through every lecture that has open questions "
-                             "or \\todo markers, in order, then propagate and "
-                             "reassemble.")
+                        help="Follow-up mode over the whole course: put every "
+                             "lecture's open questions to you first, in one "
+                             "sitting, then run the revisions unattended, "
+                             "propagate and reassemble.")
     parser.add_argument("--no-propagate", action="store_true",
                         help="With --answer/--answer-all: skip updating later "
                              "lectures after the revisions.")
+    parser.add_argument("--no-boards", dest="boards", action="store_false",
+                        help="Skip board segmentation. By default every "
+                             "lecture with a video is segmented into board "
+                             "states (boards/boards.json plus a clean, "
+                             "lecturer-free snapshot of each), and the "
+                             "stills go to the model that writes the notes.")
+    parser.add_argument("--boards-color", action="store_true",
+                        help="Analyse boards in colour (default: greyscale).")
+    # Segmentation used to be opt-in. Without this, argparse's prefix matching
+    # would quietly read a leftover `--boards` as `--boards-color`.
+    parser.add_argument("--boards", dest="boards_legacy",
+                        action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--lecturer", metavar="NAME", default=None,
+                        help="Who is lecturing, for all lectures in this run "
+                             "(the usual case: one speaker). The notes refer "
+                             "to them by surname, as published notes do. "
+                             "Without this, each new lecture's speaker is "
+                             "asked once, with a guess from the titles offered "
+                             "as the default; the answers are remembered. Pass "
+                             "\"the lecturer\" to keep the notes anonymous.")
+    parser.add_argument("--style-exemplar", metavar="FILE", action="append",
+                        default=[],
+                        help="A .tex/.md file whose writing style the notes "
+                             "should imitate (register only, never content). "
+                             "Repeatable; remembered across runs.")
+    parser.add_argument("--logs", action="store_true",
+                        help="Print a digest of what the agents have done "
+                             "(from output/logs/) and exit.")
+    parser.add_argument("--export", metavar="DIR", default=None,
+                        help="Also write the course to DIR as a multi-file "
+                             "LaTeX project: main.tex, one .tex per lecture "
+                             "under lectures/, and references.bib. With no "
+                             "videos given, exports from the saved state and "
+                             "exits.")
+    parser.add_argument("--export-compile", action="store_true",
+                        help="With --export: compile-check the exported "
+                             "main.tex as well.")
     parser.add_argument("--no-verify", action="store_true",
                         help="Skip the accuracy-verification pass that "
                              "re-reads each newly written lecture against its "
@@ -1479,6 +2239,30 @@ def main():
     whisper_model = resolve_whisper_model(args.whisper_model, args.transcribe)
     language = resolve_language(args.language)
 
+    if args.logs:
+        print(summarize(Path(args.output_dir) / LOG_SUBDIR))
+        return
+
+    def do_export(state: dict, slugs: list[str] | None = None,
+                  title: str | None = None) -> None:
+        main_tex = export_project(Path(args.output_dir), state,
+                                  Path(args.export), slugs, title)
+        if args.export_compile:
+            errors = check_latex(main_tex)
+            if errors is None:
+                print("(no LaTeX toolchain found on PATH — "
+                      "skipping compile check)")
+            elif errors:
+                print_errors(main_tex, errors)
+            else:
+                print(f"Compile check OK: {main_tex.name}")
+
+    # Export-only: no inputs to ingest, just re-emit the saved course.
+    if args.export and not (args.videos or args.from_file or args.answer
+                            or args.answer_all or args.verify):
+        do_export(load_state(Path(args.output_dir)))
+        return
+
     if args.verify:
         output_root = Path(args.output_dir)
         output_tex = (Path(args.output) if args.output
@@ -1492,6 +2276,13 @@ def main():
             known = ", ".join(sorted(state["sections"])) or "(none)"
             sys.exit(f"No generated section for '{args.verify}'. "
                      f"Known: {known} (or 'all').")
+        # No questions in this mode — the notes already exist — but --lecturer
+        # still applies, so a course written before a name was recorded can be
+        # given one and re-checked.
+        if args.lecturer:
+            resolve_lecturers([output_root / s for s in slugs], state,
+                              forced=args.lecturer)
+            save_state(output_root, state)
         run_usage = Usage()
         for i, slug in enumerate(slugs, 1):
             print(f"\n=== [{i}/{len(slugs)}] verifying {slug} ===")
@@ -1503,6 +2294,8 @@ def main():
                             frame_model=args.frame_model,
                             fix_rounds=args.latex_fix_rounds,
                             run_usage=run_usage)
+        if args.export:
+            do_export(state)
         print_usage_totals(run_usage, state)
         return
 
@@ -1512,12 +2305,19 @@ def main():
         output_root = Path(args.output_dir)
         output_tex = (Path(args.output) if args.output
                       else output_root / "course.tex")
+        if args.lecturer:
+            saved = load_state(output_root)
+            resolve_lecturers([output_root / s for s in ordered_slugs(saved)],
+                              saved, forced=args.lecturer)
+            save_state(output_root, saved)
         answer_lectures(output_root,
                         [args.answer] if args.answer else None,
                         output_tex, args.backend, args.model,
                         args.frame_model, args.wait,
                         propagate=not args.no_propagate,
                         fix_rounds=args.latex_fix_rounds)
+        if args.export:
+            do_export(load_state(output_root))
         return
 
     inputs = parse_inputs(args)
@@ -1534,6 +2334,30 @@ def main():
     state = load_state(output_root)
     if args.title:
         state["title"] = args.title
+    if args.style_exemplar:
+        state["style_exemplars"] = [str(Path(f).resolve())
+                                    for f in args.style_exemplar]
+        state.pop("style_passages", None)      # re-extract for a new exemplar
+    if state.get("style_exemplars") and "style_passages" not in state:
+        # Done once per course and cached: a model reads each exemplar whole,
+        # picks passages from across it, and rewrites them to stand alone;
+        # each rewrite is then compiled against the original and kept only if
+        # it renders the same. See style_extract.
+        passages = []
+        for path in state["style_exemplars"]:
+            try:
+                passages += extract_style(
+                    Path(path), output_root / "style",
+                    backend=args.backend, model=args.model,
+                    log_dir=output_root / LOG_SUBDIR)
+            except Exception as exc:
+                print(f"  Warning: style extraction failed for "
+                      f"{Path(path).name}: {exc}")
+        state["style_passages"] = passages
+        save_state(output_root, state)
+        if not passages:
+            print("  Warning: no style passage survived verification — the "
+                  "notes will be written without an exemplar.")
     title = state.get("title") or "Lecture Notes"
 
     if args.regen:
@@ -1596,6 +2420,11 @@ def main():
         transcribe_pending(pending, whisper_model, language,
                            args.transcribe, args.modal_fetch)
     warn_language_mismatch(lecture_dirs, language)
+    if args.boards_legacy:
+        print("Note: --boards is now the default; the flag does nothing. "
+              "Use --no-boards to skip segmentation.")
+    if args.boards:
+        prepare_boards(lecture_dirs, color=args.boards_color)
 
     # ------------------------------------------------------------------
     # Step 2: Generate LaTeX sections lecture by lecture
@@ -1605,6 +2434,16 @@ def main():
     print(f"\n=== Step 2: Generate notes "
           f"({len(cached)} cached, {len(pending)} to write) ===")
     run_usage = Usage()
+
+    # Who is speaking, asked before any model runs — one sitting, like the
+    # follow-up questions. Only for lectures about to be written: a name
+    # cannot change notes that already exist (--regen drops them, so those
+    # get asked again).
+    lecturers = resolve_lecturers(
+        lecture_dirs, state, forced=args.lecturer, ask_for=pending,
+        backend=args.backend, model=args.model, frame_model=args.frame_model,
+        work_dir=output_root / "lecturers", log_dir=output_root / LOG_SUBDIR)
+    save_state(output_root, state)
 
     # Cached section bodies bake in "Lecture N" headings and \label{lec:N}
     # labels. If the input order changed (insertion/reorder), those numbers no
@@ -1625,6 +2464,7 @@ def main():
         print("  Their cached bodies keep the old numbering and labels. "
               "Use --regen <slug> to rewrite them.\n")
 
+    unwritten: list[str] = []
     for i, ldir in enumerate(lecture_dirs, 1):
         key = ldir.name
         if key in state["sections"]:
@@ -1635,12 +2475,23 @@ def main():
 
             print(f"\n[{i}/{len(lecture_dirs)}] Writing lecture {i} ({ldir.name})…",
                   end="", flush=True)
-            section, new_corrections, new_preamble, usage = generate_section(
-                i, ldir, prior_latex, state.get("corrections", {}),
-                loaded_refs, refs_dir, state.get("preamble_additions", []),
-                backend=args.backend, model=args.model,
-                frame_model=args.frame_model, wait=args.wait,
-            )
+            try:
+                section, new_corrections, new_preamble, usage = \
+                    generate_section(
+                        i, ldir, prior_latex, state.get("corrections", {}),
+                        loaded_refs, refs_dir,
+                        state.get("preamble_additions", []),
+                        state.get("style_passages", []),
+                        lecturer=lecturers.get(key),
+                        backend=args.backend, model=args.model,
+                        frame_model=args.frame_model, wait=args.wait,
+                    )
+            except SectionNotWritten as exc:
+                # Not cached, so a rerun retries it — and the run carries on
+                # rather than losing the other 23 lectures to one bad turn.
+                print(f" FAILED: {exc}")
+                unwritten.append(key)
+                continue
             run_usage.add(usage)
             summary_path = ldir / "summary.md"
             summary = (summary_path.read_text().strip()
@@ -1668,6 +2519,13 @@ def main():
                 verify_lecture(output_root, state, key, args.backend,
                                args.model, args.frame_model, run_usage)
 
+    if unwritten:
+        # Loud, and at the end where it will be seen: the assembled document
+        # is missing these lectures entirely.
+        print(f"\n*** {len(unwritten)} lecture(s) were NOT written and are "
+              f"missing from the course: {', '.join(unwritten)}")
+        print("*** Rerun to retry them (they were deliberately not cached).")
+
     # ------------------------------------------------------------------
     # Step 3: Assemble final document (always, so it reflects latest state)
     # ------------------------------------------------------------------
@@ -1679,6 +2537,8 @@ def main():
                         backend=args.backend, model=args.model,
                         frame_model=args.frame_model,
                         fix_rounds=args.latex_fix_rounds, run_usage=run_usage)
+    if args.export:
+        do_export(state, [d.name for d in lecture_dirs], title)
     print_usage_totals(run_usage, state)
 
 

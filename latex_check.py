@@ -51,18 +51,40 @@ class LatexError:
         return out
 
 
+# TeX reports an error two ways, and which one you get depends on a flag.
+# Plain: "! Undefined control sequence."  With -file-line-error:
+# "./diagram.tex:7: Undefined control sequence." — no leading "! " at all.
+# Reading only the first form is how the diagram compile-repair loop went
+# blind: its pdflatex call passes -file-line-error, so every error parsed to
+# nothing and the agent was told "pdflatex failed." with no detail, burned its
+# attempts and wrote prose instead of the diagram. The filename is required to
+# be a TeX source so an ordinary log line carrying a colon and a number cannot
+# masquerade as an error.
+_FILE_LINE = re.compile(r"^(?:\./)?(\S+\.(?:tex|sty|cls|ltx|def)):(\d+):\s*(.+)$")
+
+
+def _error_head(line: str) -> tuple[str, int | None] | None:
+    """(message, line number) if this log line starts an error, else None."""
+    if line.startswith("! "):
+        return line[2:].strip(), None
+    m = _FILE_LINE.match(line)
+    if m:
+        return m.group(3).strip(), int(m.group(2))
+    return None
+
+
 def _parse_errors(text: str) -> list[LatexError]:
     lines = text.splitlines()
     errors: list[LatexError] = []
     for i, ln in enumerate(lines):
-        if not ln.startswith("! "):
+        head = _error_head(ln)
+        if head is None:
             continue
-        message = ln[2:].strip()
-        lineno = None
+        message, lineno = head
         detail: list[str] = []
         for j in range(i + 1, min(i + 15, len(lines))):
             nxt = lines[j]
-            if nxt.startswith("! "):
+            if _error_head(nxt) is not None:
                 break
             m = re.match(r"^l\.(\d+)(.*)$", nxt)
             if m:
@@ -74,6 +96,14 @@ def _parse_errors(text: str) -> list[LatexError]:
             if not _NOISE.match(nxt):
                 detail.append(nxt)
         errors.append(LatexError(message, lineno, "\n".join(detail)))
+    # Both spellings in one log would double-report the same error.
+    seen, unique = set(), []
+    for e in errors:
+        key = (e.message, e.line)
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
+    errors = unique
 
     causes = [e for e in errors
               if not e.message.startswith(_CONSEQUENCE)]
@@ -127,8 +157,15 @@ def check_latex(tex_path: Path) -> list[LatexError] | None:
             cmd = [pdflatex, "-interaction=nonstopmode", "-draftmode",
                    "-output-directory", td, tex_path.name]
         try:
+            # errors="replace": TeX writes raw 8-bit bytes to stdout (font
+            # names, ^^-escaped chars from a stray byte in the source), and
+            # strict UTF-8 decoding raises *inside* subprocess.run — so the
+            # crash lands before any log parsing, taking the whole build down
+            # after every lecture is already written. The .log is read with
+            # the same tolerance below for the same reason.
             proc = subprocess.run(cmd, cwd=tex_path.parent,
-                                  capture_output=True, text=True, timeout=900)
+                                  capture_output=True, text=True,
+                                  errors="replace", timeout=900)
         except subprocess.TimeoutExpired:
             return [LatexError("LaTeX compilation timed out after 900s")]
 
