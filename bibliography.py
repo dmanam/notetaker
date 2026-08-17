@@ -23,9 +23,19 @@ from fetch import arxiv_id_of
 DOI_RE = r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+"
 
 BIB_FILENAME = "references.bib"
-BIB_PREAMBLE = ("%% biblatex loads after hyperref; the running bibliography\n"
-                "\\usepackage[backend=biber,style=alphabetic]{biblatex}\n"
-                "\\addbibresource{%s}")
+BIB_PREAMBLE = r"""
+%% biblatex loads after hyperref; the running bibliography
+\RequirePackage[
+  style=alphabetic,
+  maxbibnames=99,
+  minbibnames=99,
+  maxalphanames=99,
+  minalphanames=99,
+  useprefix=true,
+]{biblatex}
+\addbibresource{%s}
+"""
+
 BIB_PRINT = "\\printbibliography[heading=bibintoc]"
 
 

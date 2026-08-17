@@ -106,12 +106,10 @@ PREAMBLE_TEMPLATE = r"""\documentclass[11pt]{article}
 \usetikzlibrary{arrows.meta,decorations.pathmorphing,positioning,calc,patterns}
 %% Additions requested by Claude during note generation:
 %(extra_preamble)s
-%% hyperref before cleveref; colorlinks keeps the PDF clean
+%% hyperref before cleveref
 \usepackage[
-  colorlinks=true,
-  linkcolor=blue!60!black,
-  citecolor=green!50!black,
-  urlcolor=blue!70!black,
+  bookmarksdepth=3,
+  linktoc=all,
   bookmarksnumbered=true,
   pdfusetitle,
 ]{hyperref}
