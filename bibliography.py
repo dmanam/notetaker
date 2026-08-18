@@ -9,6 +9,13 @@ Sources:
   arXiv IDs/URLs — arxiv.org/bibtex/<id> (proper entry with a real key)
   DOIs           — doi.org content negotiation (application/x-bibtex)
   anything else  — a generated @online entry
+
+An entry's url is dropped when it only repeats a link the entry already
+carries — the abs page for its own eprint, the resolver link for its own DOI
+— because biblatex prints those from the eprint and doi fields anyway and the
+address would otherwise appear twice. A doi field holding the resolver URL
+rather than the DOI is reduced to the DOI, for the same reason: biblatex puts
+the resolver back.
 """
 
 from __future__ import annotations
@@ -18,7 +25,7 @@ import urllib.request
 from datetime import date
 from pathlib import Path
 
-from fetch import arxiv_id_of
+from fetch import ARXIV_ID_RE, arxiv_id_of
 
 DOI_RE = r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+"
 
@@ -33,6 +40,10 @@ BIB_PREAMBLE = r"""
   minalphanames=99,
   useprefix=true,
 ]{biblatex}
+%% improve arXiv citation formatting
+\DeclareFieldFormat{eprint:arXiv}{%%
+  \href{https://arxiv.org/abs/#1}{{\tt arXiv:\allowbreak#1\iffieldundef{eprintclass}{}{\discretionary{}{}{\,}[\thefield{eprintclass}]}}}%%
+}
 \addbibresource{%s}
 """
 
@@ -219,6 +230,7 @@ def cite(bib_file: Path, url_or_id: str, title: str | None = None,
 
     entry = fetch_bibtex(url_or_id, title, author, year)
     entry, mojibake = sanitize_entry(entry)
+    entry = tidy_entry(entry)
     key = entry_key(entry) or _slug_key(title or url_or_id)
     ascii_key = _ascii_key(key)
     if ascii_key != key:
@@ -246,34 +258,192 @@ def cite(bib_file: Path, url_or_id: str, title: str | None = None,
     return key, True
 
 
-def _field(entry: str, name: str) -> str:
-    """One BibTeX field value, tolerating nested braces (author={N{\\"o}beling})
-    and unbraced values (year=1968)."""
+# ---------------------------------------------------------------------------
+# Reading and rewriting fields
+# ---------------------------------------------------------------------------
+
+def _field_span(entry: str, name: str) -> tuple[int, int, str] | None:
+    """(start, end, value) of one BibTeX field, tolerating nested braces
+    (author={N{\\"o}beling}) and unbraced values (year=1968). start is at the
+    field name, end just past the closing brace/quote/token."""
     m = re.search(rf"\b{name}\s*=\s*", entry, re.I)
     if not m:
-        return ""
+        return None
     i = m.end()
     if i >= len(entry):
-        return ""
+        return None
     if entry[i] == "{":
-        depth, start = 0, i + 1
+        depth = 0
         for j in range(i, len(entry)):
             if entry[j] == "{":
                 depth += 1
             elif entry[j] == "}":
                 depth -= 1
                 if depth == 0:
-                    return entry[start:j]
-        return entry[start:]
+                    return m.start(), j + 1, entry[i + 1:j]
+        return m.start(), len(entry), entry[i + 1:]
     if entry[i] == '"':
         j = entry.find('"', i + 1)
-        return entry[i + 1:j] if j != -1 else entry[i + 1:]
+        if j == -1:
+            return m.start(), len(entry), entry[i + 1:]
+        return m.start(), j + 1, entry[i + 1:j]
     m2 = re.match(r"[^,}\s]+", entry[i:])
-    return m2.group(0) if m2 else ""
+    return (m.start(), i + m2.end(), m2.group(0)) if m2 else (m.start(), i, "")
+
+
+def _field(entry: str, name: str) -> str:
+    span = _field_span(entry, name)
+    return span[2] if span else ""
 
 
 def _clean(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("{", "").replace("}", "")).strip()
+
+
+def _drop_field(entry: str, name: str) -> str:
+    """Remove a field and its separator, in both the layouts we are handed:
+    arXiv's one-field-per-line and Crossref's everything-on-one-line."""
+    span = _field_span(entry, name)
+    if not span:
+        return entry
+    start, end, _ = span
+    end += re.match(r"[ \t]*,?[ \t]*", entry[end:]).end()
+    head = entry[:start]
+    if re.search(r"\n[ \t]*$", head):
+        # The field had a line to itself; take the line with it.
+        head = re.sub(r"[ \t]*$", "", head)
+        if entry[end:end + 1] == "\n":
+            end += 1
+    return head + entry[end:]
+
+
+# ---------------------------------------------------------------------------
+# Redundant links
+# ---------------------------------------------------------------------------
+
+def _norm_url(url: str) -> str:
+    u = _clean(url).replace("\\", "")
+    u = re.sub(r"^https?://", "", u, flags=re.I)
+    u = re.sub(r"^www\.", "", u, flags=re.I)
+    return u.rstrip("/")
+
+
+def _doi_url_target(url: str) -> str | None:
+    """The DOI a URL resolves, if the URL is nothing but a DOI resolver link."""
+    m = re.fullmatch(rf"(?:dx\.)?doi\.org/({DOI_RE})", _norm_url(url), re.I)
+    return m.group(1) if m else None
+
+
+def _arxiv_url_id(url: str) -> str | None:
+    """The eprint a URL points at, if the URL is nothing but an arXiv link."""
+    u = _norm_url(url)
+    m = re.fullmatch(rf"arxiv\.org/(?:abs|pdf|html|e-print)/({ARXIV_ID_RE})"
+                     rf"(?:\.pdf)?", u, re.I)
+    if m:
+        return m.group(1)
+    doi = _doi_url_target(u) or ""
+    m = re.fullmatch(rf"10\.48550/arxiv\.({ARXIV_ID_RE})", doi, re.I)
+    return m.group(1) if m else None
+
+
+def _bare_eprint(eprint: str) -> str:
+    return re.sub(r"v\d+$", "", eprint.strip()).lower()
+
+
+def _url_is_redundant(entry: str, url: str) -> bool:
+    eprint = _clean(_field(entry, "eprint"))
+    archive = (_clean(_field(entry, "archivePrefix"))
+               or _clean(_field(entry, "eprinttype")))
+    if eprint and archive.lower() == "arxiv":
+        aid = _arxiv_url_id(url)
+        if aid and _bare_eprint(aid) == _bare_eprint(eprint):
+            return True
+    doi = doi_of(_clean(_field(entry, "doi")))
+    target = _doi_url_target(url)
+    # DOIs are case-insensitive, and Crossref lowercases the one it puts in
+    # the DOI field while leaving the url it built from it alone.
+    return bool(doi and target and target.lower() == doi.lower())
+
+
+def strip_redundant_url(entry: str) -> str:
+    """Drop a url field that only repeats a link the entry already carries.
+
+    biblatex renders the eprint and the DOI as links in their own right, so
+    an entry whose url is the abs page for its own eprint prints the same
+    address twice — once as arXiv:2102.13459 and once in full underneath.
+    That is exactly what arxiv.org/bibtex hands back, and Crossref does the
+    same with dx.doi.org. A url pointing anywhere else (a published version,
+    an author's page) is real information and stays.
+    """
+    span = _field_span(entry, "url")
+    if not span or not _url_is_redundant(entry, span[2]):
+        return entry
+    # urldate says when the url was seen; without a url it says nothing.
+    return _drop_field(_drop_field(entry, "url"), "urldate")
+
+
+def normalize_doi(entry: str) -> str:
+    """Reduce a doi field to the bare DOI.
+
+    arXiv's BibTeX puts the resolver URL in the field
+    (doi={https://doi.org/10.1017/fmp.2021.4}), and biblatex prefixes the doi
+    field with the resolver itself — so the entry prints the address twice
+    over, behind a link (https://doi.org/https://doi.org/...) that resolves to
+    nothing.
+    """
+    span = _field_span(entry, "doi")
+    if not span:
+        return entry
+    start, end, value = span
+    doi = doi_of(_clean(value))
+    if not doi or _clean(value) == doi:
+        return entry
+    # The field name is written both ways (doi= from arXiv, DOI= from
+    # Crossref) and biber does not care, so keep whichever it already is.
+    head = re.match(r"\bdoi\s*=\s*", entry[start:], re.I).group(0)
+    return entry[:start] + head + "{" + doi + "}" + entry[end:]
+
+
+def tidy_entry(entry: str) -> str:
+    """Every fix applied to an entry on its way into the bibliography."""
+    return normalize_doi(strip_redundant_url(entry))
+
+
+def _entry_spans(text: str) -> list[tuple[int, int]]:
+    """(start, end) of each @entry in a .bib file, by brace matching."""
+    spans: list[tuple[int, int]] = []
+    for m in re.finditer(r"@\w+\s*\{", text):
+        if spans and m.start() < spans[-1][1]:
+            continue
+        depth = 0
+        for j in range(m.end() - 1, len(text)):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    spans.append((m.start(), j + 1))
+                    break
+    return spans
+
+
+def tidy_bibliography(bib_file: Path) -> int:
+    """tidy_entry over a .bib already on disk; returns the number of
+    entries changed. New entries are cleaned as they are added — this is for
+    the ones an earlier run wrote. Idempotent."""
+    if not bib_file.exists():
+        return 0
+    text = bib_file.read_text()
+    out, changed = text, 0
+    for start, end in reversed(_entry_spans(text)):
+        entry = text[start:end]
+        pruned = tidy_entry(entry)
+        if pruned != entry:
+            out = out[:start] + pruned + out[end:]
+            changed += 1
+    if changed:
+        bib_file.write_text(out)
+    return changed
 
 
 def list_entries(bib_file: Path) -> list[dict]:

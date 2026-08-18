@@ -34,7 +34,8 @@ import json
 import sys
 from pathlib import Path
 
-from bibliography import BIB_FILENAME, attach_to_document
+from bibliography import (BIB_FILENAME, attach_to_document,
+                          tidy_bibliography)
 from claude_backend import (BACKENDS, collect_followup_answers, count_todos,
                             mark_answers_applied, run_agent)
 from latex_check import check_latex, print_errors
@@ -114,6 +115,7 @@ def check_and_fix(output_path: Path, ctx_factory, backend: str,
         # preamble the \addbibresource goes with it and every \cite turns
         # into a "Citation undefined" that the next round then tries to fix
         # by hand.
+        tidy_bibliography(output_path.parent / BIB_FILENAME)
         if attach_to_document(output_path, output_path.parent / BIB_FILENAME):
             print(f"  Wired {BIB_FILENAME} into {output_path.name} "
                   f"(biblatex + \\printbibliography).")

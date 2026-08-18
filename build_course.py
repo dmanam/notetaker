@@ -67,7 +67,7 @@ from ingest import (download_video, expand_playlist, extract_audio, is_url,
 from fetch import describe_assets, fetch_reference, load_cached_reference
 from agent_log import summarize
 from bibliography import (BIB_FILENAME, BIB_PREAMBLE, BIB_PRINT, has_entries,
-                          list_entries)
+                          list_entries, tidy_bibliography)
 from style_extract import extract as extract_style
 from boards import analyse
 from lecturer import (ATTRIBUTION_INSTRUCTION, lecturer_note,
@@ -1240,6 +1240,8 @@ def render_document(title: str, body_parts: list[str], state: dict,
     bib_src = output_root / BIB_FILENAME
     with_bib = has_entries(bib_src)
     if with_bib:
+        # Entries written before this ran, and entries a hand edit reinstated.
+        tidy_bibliography(bib_src)
         # biblatex resolves \addbibresource relative to the .tex file.
         if bib_src.resolve() != (output_tex.parent / BIB_FILENAME).resolve():
             shutil.copy2(bib_src, output_tex.parent / BIB_FILENAME)
@@ -1290,6 +1292,8 @@ def export_project(output_root: Path, state: dict, dest: Path,
     bib_src = output_root / BIB_FILENAME
     with_bib = has_entries(bib_src)
     if with_bib:
+        # Entries written before this ran, and entries a hand edit reinstated.
+        tidy_bibliography(bib_src)
         shutil.copy2(bib_src, dest / BIB_FILENAME)
 
     inputs, seen = [], set()
