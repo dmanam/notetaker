@@ -115,6 +115,15 @@ PREAMBLE_TEMPLATE = r"""\documentclass[11pt]{article}
 ]{hyperref}
 %% cleveref last — produces "Theorem 2.3", "Definition 1.4", etc. automatically
 \usepackage[nameinlink,noabbrev,capitalise]{cleveref}
+%% reference sections with \S
+\crefformat{section}{#2\S#1#3}
+\Crefformat{section}{#2\S#1#3}
+\crefmultiformat{section}{\S\S#2#1#3}{ and~#2#1#3}{, #2#1#3}{, and~#2#1#3}
+\crefrangeformat{section}{\S\S#3#1#4-#5#2#6}
+\crefformat{subsection}{#2\S#1#3}
+\Crefformat{subsection}{#2\S#1#3}
+\crefmultiformat{subsection}{\S\S#2#1#3}{ and~#2#1#3}{, #2#1#3}{, and~#2#1#3}
+\crefrangeformat{subsection}{\S\S#3#1#4-#5#2#6}
 %(bibliography)s
 
 %% Make equation and figure numbering per-section
