@@ -124,7 +124,10 @@ def style_exemplar_block(passages: list) -> str:
         "Their machinery is theirs, not yours: the \\cite keys, \\label names "
         "and \\ref targets in them belong to that document and do not exist "
         "here. Follow this course's own rules for citing and "
-        "cross-referencing, whatever the excerpts happen to do.\n\n"
+        "cross-referencing, whatever the excerpts happen to do. They "
+        "carry no margin timestamps either, because they were not "
+        "written from a recording — that is not a licence to leave "
+        "yours out.\n\n"
         + "\n\n".join(parts) + "\n\n")
 
 

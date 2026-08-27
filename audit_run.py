@@ -16,6 +16,8 @@ Columns:
   prov       diagrams carrying a "% board N" provenance comment
   eq         numbered equations
   todo       unresolved \\todo markers
+  ts         margin timestamps — a section with prose and none of them is a
+             writer that ignored the rule, so it is flagged
   W          boards the WRITING pass opened, out of the lecture's total
   V          boards the CHECKING pass opened (targeted; a low number is fine)
   ?          open questions queued for --answer
@@ -28,6 +30,8 @@ import argparse
 import json
 import re
 from pathlib import Path
+
+from timestamps import marks
 
 
 def boards_total(lecture_dir: Path) -> int:
@@ -132,8 +136,10 @@ def main() -> None:
     order = sorted(sections, key=lambda s: sections[s]["lecture_num"])
 
     print(f"{'#':>3} {'lecture':40s} {'kB':>5} {'cue':>4} {'diag':>4} "
-          f"{'prov':>4} {'eq':>3} {'todo':>4} {'W':>7} {'V':>4} {'?':>2}")
-    flagged, dropped, totals = [], [], dict(diag=0, prov=0, todo=0, q=0, cue=0)
+          f"{'prov':>4} {'eq':>3} {'todo':>4} {'ts':>4} {'W':>7} {'V':>4} "
+          f"{'?':>2}")
+    flagged, dropped, unmarked = [], [], []
+    totals = dict(diag=0, prov=0, todo=0, q=0, cue=0, ts=0)
     for slug in order:
         d = root / slug
         section = d / "section.tex"
@@ -145,6 +151,7 @@ def main() -> None:
         diag = count(r"\\begin\{tikzcd\}", text)
         prov = count(r"%\s*board\s+\d+", text)
         todo = count(r"\\todo\{", text)
+        ts = len(marks(text))
         q = open_questions(section)
         cue = diagram_cues(d)
         totals["cue"] += cue
@@ -153,7 +160,11 @@ def main() -> None:
         if cue >= 3 and diag == 0:
             dropped.append((slug, cue))
         totals["diag"] += diag; totals["prov"] += prov
-        totals["todo"] += todo; totals["q"] += q
+        totals["todo"] += todo; totals["q"] += q; totals["ts"] += ts
+        # Every paragraph should carry one. A section with prose and none at
+        # all is not a lecture without paragraphs, it is the rule ignored.
+        if ts == 0 and len(text) > 1000:
+            unmarked.append(slug)
         short = w is not None and total and w < total
         if short:
             flagged.append((slug, w, total))
@@ -161,11 +172,18 @@ def main() -> None:
               f"{len(text)/1000:5.0f} {cue:>4} {diag:>4}"
               f"{'!' if (cue >= 3 and diag == 0) else ' '}{prov:>4} "
               f"{count(r'\\begin\{equation\}', text):>3} {todo:>4} "
+              f"{ts:>4}{'!' if (ts == 0 and len(text) > 1000) else ' '}"
               f"{(str(w) + '/' + str(total)):>7}{'!' if short else ' '} "
               f"{(v if v is not None else '-'):>4} {q:>2}")
 
+    if unmarked:
+        print("\nSections with prose and no margin timestamps — nothing in "
+              "them points back at the video:")
+        for slug in unmarked:
+            print(f"  {slug}")
     print(f"\n{len(order)} lecture(s): {totals['diag']} diagram(s), "
           f"{totals['prov']} board-attributed, {totals['todo']} \\todo, "
+          f"{totals['ts']} margin timestamp(s), "
           f"{totals['q']} open question(s)")
     if dropped:
         print("\nLectures that point at the board repeatedly and draw "

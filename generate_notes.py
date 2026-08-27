@@ -36,6 +36,7 @@ from pathlib import Path
 
 from bibliography import (BIB_FILENAME, attach_to_document,
                           tidy_bibliography)
+from timestamps import attach_macro
 from claude_backend import (BACKENDS, collect_followup_answers, count_todos,
                             mark_answers_applied, run_agent)
 from latex_check import check_latex, print_errors
@@ -44,7 +45,8 @@ from instructions import (ASK_USER_RULE, ASR_INSTRUCTION, CLARIFY_RULE,
                           CROSSREF_RULE, DISFLUENCY_RULE, DISPLAY_RULES,
                           FIDELITY_INSTRUCTION, FRAMES_RULE,
                           HOUSE_STYLE_INSTRUCTION, MACRO_BRACING_RULE,
-                          TODO_RULE, cite_rule, diagram_rules)
+                          TIMESTAMP_RULE, TODO_RULE, cite_rule,
+                          diagram_rules)
 from media import find_video, format_transcript
 from notes_tools import (NotesToolContext, REGISTER_INSTRUCTION,
                          style_exemplar_block)
@@ -80,7 +82,7 @@ Guidelines:
   proposition, corollary, definition and numbered equation you expect to
   cite. Give labels meaningful names: \label{thm:tilting-equivalence}, not
   \label{thm:1}.
-""" + CROSSREF_RULE + "\n" + FRAMES_RULE + "\n" + CLARIFY_RULE + r"""
+""" + TIMESTAMP_RULE + "\n" + CROSSREF_RULE + "\n" + FRAMES_RULE + "\n" + CLARIFY_RULE + r"""
 - Define macros with care.
 """ + MACRO_BRACING_RULE + "\n" + cite_rule(shared=False) + "\n" \
     + ASK_USER_RULE + "\n" \
@@ -89,8 +91,8 @@ Guidelines:
 """ + diagram_rules(board_tools=False) + "\n" + DISPLAY_RULES + "\n" \
     + DISFLUENCY_RULE + r"""
 - The transcript provides timestamps [hh:mm:ss] before each segment. Use them
-  to decide when to call get_frame, and to stamp any question you queue for
-  the user — do not include them in the notes themselves.
+  to decide when to call get_frame, to stamp any question you queue for the
+  user, and to write the margin marks described above.
 
 Write the complete LaTeX document (starting with \documentclass) to the output
 file named in the task instructions. Do not put the LaTeX source in your reply
@@ -110,15 +112,19 @@ def check_and_fix(output_path: Path, ctx_factory, backend: str,
     """Compile-check the notes; on failure hand the errors back to the model
     and re-check, up to fix_rounds times."""
     for attempt in range(fix_rounds + 1):
-        # Before every compile, not once at the end: the model is told not to
-        # write bibliography machinery, so if a fix round rewrites the
-        # preamble the \addbibresource goes with it and every \cite turns
-        # into a "Citation undefined" that the next round then tries to fix
-        # by hand.
+        # Before every compile, not once at the end: the model is told to
+        # write the \cite and \ts marks but none of the machinery behind
+        # them, so if a fix round rewrites the preamble the \addbibresource
+        # and the \ts definition go with it. Every \cite then turns into a
+        # "Citation undefined" and every mark into an undefined control
+        # sequence, which the next round tries to fix by deleting them.
         tidy_bibliography(output_path.parent / BIB_FILENAME)
         if attach_to_document(output_path, output_path.parent / BIB_FILENAME):
             print(f"  Wired {BIB_FILENAME} into {output_path.name} "
                   f"(biblatex + \\printbibliography).")
+        if attach_macro(output_path):
+            print(f"  Defined \\ts in {output_path.name} "
+                  f"(margin timestamps).")
         errors = check_latex(output_path)
         if errors is None:
             print("(no LaTeX toolchain found on PATH — skipping compile check)")

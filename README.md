@@ -342,6 +342,13 @@ model — which is told never to write bibliography machinery — the `biblatex`
 lines and `\printbibliography` are attached mechanically before each compile
 round, so a repair pass that rewrites the preamble cannot take them with it.
 
+### Margin timestamps
+
+Every paragraph, theorem, definition, etc. from the lecture carries
+`\ts{hh:mm:ss}` — the moment that material starts in the recording — set in
+the left margin in gray monospace. A paragraph the note-taker wrote itself
+carries no mark.
+
 ### One prompt, two entry points
 
 The course assembler and the single-lecture writer share most of what their
@@ -352,11 +359,6 @@ body-only output versus a whole document, lecture-numbered labels, the preamble
 tool, the theorem environments that already exist. Two blocks are parameterised
 rather than duplicated, since only one clause of each depends on which tools the
 driver has.
-
-This is not cosmetic. When the two prompts were maintained separately they
-drifted: the course prompt banned `\ref` in favour of cleveref while the
-single-lecture prompt still asked for it, and the diagram, fidelity and display
-rules existed in only one of them.
 
 ### Boards: recovering what was drawn
 

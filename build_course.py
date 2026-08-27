@@ -78,11 +78,13 @@ from equations import (ReviewItem, dangling_references, defined_labels,
 from latex_check import (LatexError, check_latex, compile_document,
                          print_errors, print_warnings, tokens_of)
 from media import find_video, format_timestamp, format_transcript
+from timestamps import TIMESTAMP_PREAMBLE, drop_reserved
 from instructions import (ASK_USER_RULE, ASR_INSTRUCTION, CLARIFY_RULE,
                           CROSSREF_RULE, DISFLUENCY_RULE, DISPLAY_RULES,
                           FIDELITY_INSTRUCTION, FRAMES_RULE,
                           HOUSE_STYLE_INSTRUCTION, MACRO_BRACING_RULE,
-                          TODO_RULE, cite_rule, diagram_rules)
+                          TIMESTAMP_RULE, TODO_RULE, cite_rule,
+                          diagram_rules)
 from notes_tools import (NotesToolContext, REGISTER_INSTRUCTION,
                          ask_user_input, style_exemplar_block)
 from usage import Usage, format_usage
@@ -101,7 +103,7 @@ PREAMBLE_TEMPLATE = r"""\documentclass[11pt]{article}
 \usepackage{parskip}
 \usepackage{enumitem}
 \usepackage[colorinlistoftodos,obeyDraft]{todonotes}
-%% Diagrams: tikz-cd for commutative diagrams, tikz for everything drawn
+%(timestamps)s%% Diagrams: tikz-cd for commutative diagrams, tikz for everything drawn
 \usepackage{tikz-cd}
 \usetikzlibrary{arrows.meta,decorations.pathmorphing,positioning,calc,patterns}
 %% Additions requested by Claude during note generation:
@@ -204,7 +206,7 @@ Rules:
   collide across lectures: \label{eq:N:...}, \label{thm:N:...},
   \label{def:N:...}, and so on (the lecture heading itself keeps
   \label{lec:N}).
-""" + CROSSREF_RULE + r"""
+""" + TIMESTAMP_RULE + "\n" + CROSSREF_RULE + r"""
 - For lecture section labels, write \cref{lec:2} to produce a clickable
   "Section 2" link, or just write "Lecture~2" as plain text if no label exists.
 """ + FRAMES_RULE + "\n" + CLARIFY_RULE + r"""
@@ -213,7 +215,8 @@ Rules:
   \DeclareMathOperator{...}, \declaretheorem{...}, or any other declaration.
   Call it before writing the body content that depends on it.
   Already in the preamble: geometry, amsmath, amsthm, amssymb, thmtools,
-  microtype, parskip, enumitem, todonotes, and the theorem environments
+  microtype, parskip, enumitem, todonotes, marginnote, and the theorem
+  environments
   theorem, lemma, proposition, corollary, definition, example, exercise,
   remark, notation.
   Note: hyperref and cleveref are loaded last and must stay last — additions
@@ -460,6 +463,12 @@ Then fix what you found, editing the file in place:
   \todo{...} saying precisely what you doubt. Do not assert and flag: if the
   claim may be false, weaken the claim.
 - Preserve every \label{} — later lectures cite them.
+- Preserve every \ts{hh:mm:ss} — it is where that material starts in the
+  recording, and it is how a reader checks the notes against the video. If
+  you split a paragraph in two, mark the new one with the time its own
+  material starts; if you merge two, keep the earlier mark. A paragraph you
+  write yourself gets no mark — an unmarked paragraph is one the lecture did
+  not say, which is worth seeing.
 - Correct how the notes name the lecturer, if they get it wrong: a first name,
   "the speaker", "our lecturer", or a name where the task says none is on
   record. That is a word-level edit, not a licence to rewrite the prose around
@@ -1081,9 +1090,11 @@ def course_preamble(title: str, state: dict,
     # Both of these are enforced here rather than asked for in the prompt:
     # they are mechanically decidable, so a model that forgets one should not
     # be able to produce a document that is wrong.
+    early, late = drop_reserved(early), drop_reserved(late)
     late = drop_duplicate_theorems(normalize_theorem_decls(late))
     preamble = PREAMBLE_TEMPLATE % {
         "title": title,
+        "timestamps": TIMESTAMP_PREAMBLE,
         "extra_preamble": "\n".join(early),
         "extra_theorems": "\n".join(late),
         "theorem_anchors": theorem_anchor_block(late),

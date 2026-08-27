@@ -79,6 +79,46 @@ from writing more than the lecture supports:
 # Both documents load cleveref, so both get the same rule. \ref is banned
 # rather than merely discouraged: it prints a bare number, and a reader who
 # meets "by 2.3" has to go and find out what kind of thing 2.3 is.
+TIMESTAMP_RULE = r"""- Mark where the material starts in the recording. Begin every paragraph
+  that came from the lecture with \ts{hh:mm:ss}, and put the same mark
+  immediately after \begin{theorem}, \begin{definition}, \begin{proof} and
+  every other environment of that kind. It sets the time in the left margin,
+  so a reader who wants to hear a passage can find it in the video.
+  Write the mark on a line of its own — a newline before it and a newline
+  after it, and never a blank line after it, which would end the paragraph
+  and strand the mark on an empty one:
+
+      \ts{00:12:34}
+      The paragraph begins here, on the next line.
+
+      \begin{definition}\label{def:3:perfectoid}
+      \ts{00:14:02}
+      A definition, marked inside the environment.
+      \end{definition}
+
+  The time is the [hh:mm:ss] on the transcript line where the lecturer STARTS
+  that material — not where they finish it, not where you happened to confirm
+  it on a board, and never a time you estimated. Copy the transcript's own
+  mark. Where a paragraph gathers a point made over several minutes, mark
+  where the point begins. Where you write something up out of the order it
+  was said, the mark follows the lecture and not your paragraph order, so the
+  times in the margin may go backwards — that is correct, and better than a
+  tidy sequence that is wrong.
+  A paragraph with no spoken origin gets NO mark. If you wrote it yourself —
+  a sentence joining two topics, a summary of your own, background the
+  lecturer neither said nor put on the board — leave it unmarked. The margin
+  is then a record of where the notes come from, and an unmarked paragraph is
+  yours rather than the lecture's. That is a statement about provenance, not
+  a way out of finding a time: material that did come from the lecture has
+  one, and marking it is not optional.
+  One mark per paragraph or environment: not per sentence, not on a \section
+  heading, not inside a display, and not on the continuation of a paragraph
+  you have already marked. A list belongs to the paragraph that introduces
+  it — mark that paragraph, not each item.
+  \ts is already defined and needs no package. Never define it, redefine it,
+  or add anything to the preamble for it."""
+
+
 CROSSREF_RULE = r"""- Use \cref{label} for ALL cross-references (mid-sentence) and \Cref{label}
   at the start of a sentence. cleveref automatically produces the correct
   type name and number, e.g. "Theorem 2.3", "Definition 1.4", "Lecture 2".
