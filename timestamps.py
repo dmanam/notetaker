@@ -28,6 +28,7 @@ Three details in the macro are each load-bearing:
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -43,13 +44,31 @@ TIMESTAMP_PREAMBLE = r"""%% Timestamps in the left margin: \ts{hh:mm:ss} marks w
 %% options cannot clash with an earlier load that had some.
 \usepackage{xcolor}
 \newcommand{\tsfont}{\normalfont\ttfamily\footnotesize\color{black!55}}
-\newcommand{\ts}[1]{\leavevmode{\reversemarginpar\marginnote{\tsfont #1}}\ignorespaces}
+%% Each lecture's video, keyed by its section number, plus a fallback for a
+%% document that is one lecture. Both are written by the assembler, not by the
+%% note-taker, which writes nothing but \ts{hh:mm:ss}.
+\newcommand{\tsvidany}{}
+\newcommand{\tsvid}[2]{\expandafter\gdef\csname tsvid#1\endcsname{#2}}
+\newcommand{\tsvidall}[1]{\renewcommand{\tsvidany}{#1}}
+\def\tsparse#1:#2:#3\tsend{\number\numexpr#1*3600+#2*60+#3\relax}
+\newcommand{\ts}[1]{\leavevmode{%
+  \reversemarginpar
+  \edef\tsid{\ifcsname tsvid\arabic{section}\endcsname%
+    \csname tsvid\arabic{section}\endcsname\else\tsvidany\fi}%
+  \ifx\tsid\empty
+    \marginnote{\tsfont #1}%
+  \else
+    \edef\tsurl{https://youtu.be/\tsid?t=\tsparse#1\tsend}%
+    \hypersetup{pdfborder={0 0 0}}%
+    \marginnote{\href{\tsurl}{\tsfont #1}}%
+  \fi}\ignorespaces}
 """
 
 #: Macros the preamble above owns. A second definition of either is a build
 #: error ("command already defined"), so a model that writes one anyway must
 #: not be able to put it in the file.
-RESERVED = (r"\ts", r"\tsfont")
+RESERVED = (r"\ts", r"\tsfont", r"\tsvid", r"\tsvidall", r"\tsvidany",
+            r"\tsparse")
 
 _NAMES = "|".join(re.escape(m) for m in sorted(RESERVED, key=len,
                                                 reverse=True))
@@ -79,7 +98,7 @@ def drop_reserved(lines: list[str]) -> list[str]:
     return [line for line in lines if not defines_reserved(line)]
 
 
-def attach_macro(tex_file: Path) -> bool:
+def attach_macro(tex_file: Path, video: str | None = None) -> bool:
     """Define \\ts in a model-written standalone document that uses it.
 
     The single-lecture document's preamble is written by the model, which is
@@ -90,6 +109,7 @@ def attach_macro(tex_file: Path) -> bool:
     file it already edited.
     """
     tex_file = Path(tex_file)
+    block = TIMESTAMP_PREAMBLE + video_default(video)
     text = tex_file.read_text()
     if not MARK_RE.search(text):
         return False                     # nothing marked, nothing to define
@@ -100,12 +120,61 @@ def attach_macro(tex_file: Path) -> bool:
     # Lift our own block out before purging, so that re-running this cannot
     # keep dropping and re-adding it: what is rebuilt below is byte-identical
     # to what was there, and an unchanged file is not rewritten.
-    head = head.replace(TIMESTAMP_PREAMBLE, "")
+    head = head.replace(block, "")
     kept = [ln for ln in head.splitlines(keepends=True)
             if not defines_reserved(ln)]
-    new_text = ("".join(kept).rstrip() + "\n\n" + TIMESTAMP_PREAMBLE
-                + "\n" + body)
+    new_text = "".join(kept).rstrip() + "\n\n" + block + "\n" + body
     if new_text == text:
         return False
     tex_file.write_text(new_text)
     return True
+
+
+#: YouTube ids are eleven characters of this alphabet, underscores and
+#: hyphens included — both occur, and both survive \edef into the URL.
+_VIDEO_ID = r"[A-Za-z0-9_-]{11}"
+_WATCH = re.compile(
+    r"(?:youtu\.be/|youtube\.com/(?:watch\?(?:[^#\s]*&)?v=|embed/|shorts/"
+    r"|live/|v/))(" + _VIDEO_ID + r")")
+
+
+def youtube_id(url: str | None) -> str | None:
+    """The video id in a YouTube URL, or None for anything else."""
+    m = _WATCH.search(str(url or "").strip())
+    return m.group(1) if m else None
+
+
+def read_video_id(lecture_dir: Path) -> str | None:
+    """The YouTube id a lecture was downloaded from, from its info.json.
+
+    None for a lecture that came from a local file or a plain URL: there is
+    nothing to link to, and its marks stay unlinked rather than pointing at
+    some other lecture's video.
+    """
+    path = Path(lecture_dir) / "info.json"
+    if not path.exists():
+        return None
+    try:
+        info = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if info.get("source_type") != "youtube":
+        return None
+    return youtube_id(info.get("webpage_url")) or youtube_id(info.get("source"))
+
+
+def video_table(videos: dict[int, str]) -> str:
+    """\\tsvid lines registering each lecture's video.
+
+    Keyed by section number, which is the lecture number because each lecture
+    is a \\section — so the marks in a lecture link into that lecture's video
+    without anything in the body saying which video it is.
+    """
+    return "".join(f"\\tsvid{{{n}}}{{{v}}}\n"
+                   for n, v in sorted((videos or {}).items()) if v)
+
+
+def video_default(video: str | None) -> str:
+    """The same, for a document that is a single lecture and has no lecture
+    numbering to key on."""
+    return f"\\tsvidall{{{video}}}\n" if video else ""

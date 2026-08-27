@@ -347,7 +347,8 @@ round, so a repair pass that rewrites the preamble cannot take them with it.
 Every paragraph, theorem, definition, etc. from the lecture carries
 `\ts{hh:mm:ss}` — the moment that material starts in the recording — set in
 the left margin in gray monospace. A paragraph the note-taker wrote itself
-carries no mark.
+carries no mark. For a lecture that came from YouTube the mark is also a link,
+into the video at that moment.
 
 ### One prompt, two entry points
 
