@@ -45,7 +45,11 @@ for flag in (True, False):
     for tail in ("Draw diagrams the lecturer did not draw",
                  "not an idealised one"):
         assert tail in I.diagram_rules(flag), (flag, tail)
-    assert "the bibliography is assembled automatically" in I.cite_rule(flag)
+    citation_rule = I.cite_rule(flag)
+    assert "the bibliography is assembled automatically" in citation_rule
+    assert "Before finishing, audit the draft" in citation_rule
+    assert "hand-written \\footnote is not a" in citation_rule
+    assert "without inventing bibliographic" in citation_rule
 print("diagram and citation rules differ only in their tool clause")
 
 # --- the rules the drift produced -------------------------------------------

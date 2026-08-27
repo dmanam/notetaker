@@ -147,7 +147,13 @@ _CITE_TAIL = r""" (safe to call again for the same source). For arXiv
   up in the document itself if you must, since an entry without an author
   cannot get a proper [Sch19]-style citation label. Cite papers and books
   the lecturer names, and references you consulted for a definition or
-  notation. Never write bibliography entries, \bibitem, or
+  notation. Before finishing, audit the draft for every identifiable paper,
+  book, theorem attribution, and external source you used; call
+  cite_reference for each one and put the returned \cite{key} in the notes.
+  A prose-only author/title mention or a hand-written \footnote is not a
+  substitute for \cite. If a source is too vague to identify reliably,
+  preserve the lecturer's attribution without inventing bibliographic
+  metadata. Never write bibliography entries, \bibitem, or
   \printbibliography yourself — the bibliography is assembled automatically."""
 
 
