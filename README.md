@@ -12,6 +12,9 @@ A whole series becomes one `course.tex`, with cross-references between
 lectures, a running bibliography, and a compile-repair loop that fixes its own
 LaTeX errors.
 
+For an example of course notes produced with this, see
+[dmanam/analyticstacks](https://github.com/dmanam/analyticstacks).
+
 - [Requirements](#requirements)
 - [Install](#install)
 - [Quickstart](#quickstart)
@@ -34,7 +37,9 @@ LaTeX errors.
   account for GPU transcription; an NVIDIA GPU for local `large-v3` Whisper.
 
 The optional pieces degrade rather than fail — without TeX the compile check is
-skipped, without Modal transcription runs locally.
+skipped, without Modal transcription runs locally. (Note that Modal allows $30/mo
+of free usage, which is far more than enough to transcribe even several dozen
+lectures.)
 
 ## Install
 
