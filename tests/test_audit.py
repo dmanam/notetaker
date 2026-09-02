@@ -61,6 +61,28 @@ assert A.diagram_cues(noop) == 0
 assert A.diagram_cues(noop) == 0, "'triangle' must not count as a drawing"
 print("diagram_cues: counts pointing-at-the-board, ignores triangles")
 
+# --- what the reader cannot see ---------------------------------------------
+# The notes are read next to the video and nothing else, so prose pointing at
+# the transcript or at a numbered board is pointing at a file the reader does
+# not have. Comments and \todo notes are the exception in both directions:
+# they are addressed to whoever is running this, who does have both, and
+# naming a board in them is the useful thing to do — so they must not be
+# counted, or the flag fires on every lecture that was working properly.
+for text, want in [
+        ("As seen in board 7, the map is injective.", 1),
+        ("Board 12 shows the square.", 1),
+        ("The transcript is garbled here.", 1),
+        ("the board image is unclear", 1),
+        ("% board 3 @ 00:12:04 - boards/b3.png", 0),
+        ("\\todo{board 3 illegible - check the exponent $x^{2}$} It is flat.", 0),
+        ("\\todo[inline]{the transcript garbles this}", 0),
+        # Describing the lecture is not pointing at a file.
+        ("The lecturer wrote this on the board, then erased it.", 0),
+        ("A diagram chase on the square above finishes it.", 0)]:
+    got = A.artifact_mentions(text)
+    assert got == want, (text, got, want)
+print("artifact_mentions: prose only — comments and todos may name a board")
+
 # --- header and rows must have the same number of columns -------------------
 out = subprocess.run([sys.executable, str(ROOT / "audit_run.py"),
                       "--output-dir", str(root)],

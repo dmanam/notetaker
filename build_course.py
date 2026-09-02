@@ -84,7 +84,8 @@ from instructions import (ASK_USER_RULE, ASR_INSTRUCTION, CLARIFY_RULE,
                           CROSSREF_RULE, DISFLUENCY_RULE, DISPLAY_RULES,
                           FIDELITY_INSTRUCTION, FRAMES_RULE,
                           HOUSE_STYLE_INSTRUCTION, MACRO_BRACING_RULE,
-                          TIMESTAMP_RULE, TODO_RULE, cite_rule,
+                          READER_RULE, TIMESTAMP_RULE, TODO_RULE,
+                          cite_rule,
                           diagram_rules)
 from notes_tools import (NotesToolContext, REGISTER_INSTRUCTION,
                          ask_user_input, style_exemplar_block)
@@ -207,7 +208,7 @@ Rules:
   collide across lectures: \label{eq:N:...}, \label{thm:N:...},
   \label{def:N:...}, and so on (the lecture heading itself keeps
   \label{lec:N}).
-""" + TIMESTAMP_RULE + "\n" + CROSSREF_RULE + r"""
+""" + TIMESTAMP_RULE + "\n" + READER_RULE + "\n" + CROSSREF_RULE + r"""
 - For lecture section labels, write \cref{lec:2} to produce a clickable
   "Section 2" link, or just write "Lecture~2" as plain text if no label exists.
 """ + FRAMES_RULE + "\n" + CLARIFY_RULE + r"""
@@ -463,6 +464,13 @@ Then fix what you found, editing the file in place:
 - Where you suspect a problem but cannot settle it, leave the text and add a
   \todo{...} saying precisely what you doubt. Do not assert and flag: if the
   claim may be false, weaken the claim.
+- Take out anything in the PROSE that points at the working materials: the
+  transcript, a numbered board, a still. The reader has the notes and the
+  video and nothing else, so "board 7 shows" must become what board 7 showed,
+  and "the transcript is garbled here" must become what is actually unclear
+  about the mathematics. This does not apply to \todo notes or to LaTeX
+  comments — both are addressed to whoever is running this, not to the
+  reader, and naming a board in them is useful. Leave those alone.
 - Preserve every \label{} — later lectures cite them.
 - Preserve every \ts{hh:mm:ss} — it is where that material starts in the
   recording, and it is how a reader checks the notes against the video. If

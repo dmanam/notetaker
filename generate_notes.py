@@ -45,7 +45,8 @@ from instructions import (ASK_USER_RULE, ASR_INSTRUCTION, CLARIFY_RULE,
                           CROSSREF_RULE, DISFLUENCY_RULE, DISPLAY_RULES,
                           FIDELITY_INSTRUCTION, FRAMES_RULE,
                           HOUSE_STYLE_INSTRUCTION, MACRO_BRACING_RULE,
-                          TIMESTAMP_RULE, TODO_RULE, cite_rule,
+                          READER_RULE, TIMESTAMP_RULE, TODO_RULE,
+                          cite_rule,
                           diagram_rules)
 from media import find_video, format_transcript
 from notes_tools import (NotesToolContext, REGISTER_INSTRUCTION,
@@ -82,7 +83,7 @@ Guidelines:
   proposition, corollary, definition and numbered equation you expect to
   cite. Give labels meaningful names: \label{thm:tilting-equivalence}, not
   \label{thm:1}.
-""" + TIMESTAMP_RULE + "\n" + CROSSREF_RULE + "\n" + FRAMES_RULE + "\n" + CLARIFY_RULE + r"""
+""" + TIMESTAMP_RULE + "\n" + READER_RULE + "\n" + CROSSREF_RULE + "\n" + FRAMES_RULE + "\n" + CLARIFY_RULE + r"""
 - Define macros with care.
 """ + MACRO_BRACING_RULE + "\n" + cite_rule(shared=False) + "\n" \
     + ASK_USER_RULE + "\n" \

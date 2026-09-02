@@ -95,6 +95,46 @@ _CUES = re.compile(
     r"|\b(?:this|the)\s+square\b", re.I)
 
 
+# Pointing the reader at something only the pipeline can see: the transcript,
+# a numbered board, a still. The reader has the notes and the video, so "board
+# 7 shows" tells them about a file they do not have.
+_ARTIFACT = re.compile(
+    r"\btranscripts?\b|\bboards?\s*#?\s*\d+"
+    r"|\bboard\s+(?:image|still|photo)s?\b|\bvideo\s+frames?\b", re.I)
+
+
+def _strip_todos(text: str) -> str:
+    """The text with \todo{...} taken out, braces matched."""
+    out, i = [], 0
+    for m in re.finditer(r"\\todo\s*(?:\[[^\]]*\])?\s*\{", text):
+        if m.start() < i:
+            continue
+        depth, j = 0, m.end() - 1
+        while j < len(text):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        out.append(text[i:m.start()])
+        i = j + 1
+    out.append(text[i:])
+    return "".join(out)
+
+
+def artifact_mentions(text: str) -> int:
+    """How often the prose points at the working materials.
+
+    Comments and \todo notes are stripped first: both are addressed to
+    whoever is running this, who does have the transcript and the boards, and
+    naming a board in them is the useful thing to do. The rule is about the
+    document a reader sees.
+    """
+    return len(_ARTIFACT.findall(_strip_todos(re.sub(r"(?<!\\)%.*", "", text))))
+
+
 def diagram_cues(lecture_dir: Path) -> int:
     """How often the lecture refers to something drawn on the board."""
     path = lecture_dir / "transcript.json"
@@ -138,7 +178,7 @@ def main() -> None:
     print(f"{'#':>3} {'lecture':40s} {'kB':>5} {'cue':>4} {'diag':>4} "
           f"{'prov':>4} {'eq':>3} {'todo':>4} {'ts':>4} {'W':>7} {'V':>4} "
           f"{'?':>2}")
-    flagged, dropped, unmarked = [], [], []
+    flagged, dropped, unmarked, leaking = [], [], [], []
     totals = dict(diag=0, prov=0, todo=0, q=0, cue=0, ts=0)
     for slug in order:
         d = root / slug
@@ -165,6 +205,9 @@ def main() -> None:
         # all is not a lecture without paragraphs, it is the rule ignored.
         if ts == 0 and len(text) > 1000:
             unmarked.append(slug)
+        leaks = artifact_mentions(text)
+        if leaks:
+            leaking.append((slug, leaks))
         short = w is not None and total and w < total
         if short:
             flagged.append((slug, w, total))
@@ -176,6 +219,11 @@ def main() -> None:
               f"{(str(w) + '/' + str(total)):>7}{'!' if short else ' '} "
               f"{(v if v is not None else '-'):>4} {q:>2}")
 
+    if leaking:
+        print("\nSections whose prose points at the transcript or a numbered "
+              "board — the reader has neither:")
+        for slug, n in leaking:
+            print(f"  {slug}: {n} mention(s)")
     if unmarked:
         print("\nSections with prose and no margin timestamps — nothing in "
               "them points back at the video:")

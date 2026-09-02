@@ -26,7 +26,7 @@ import generate_notes as G
 SHARED = ["ASR_INSTRUCTION", "FIDELITY_INSTRUCTION", "CROSSREF_RULE",
           "FRAMES_RULE", "CLARIFY_RULE", "MACRO_BRACING_RULE",
           "ASK_USER_RULE", "TODO_RULE", "DISPLAY_RULES", "DISFLUENCY_RULE",
-          "HOUSE_STYLE_INSTRUCTION"]
+          "HOUSE_STYLE_INSTRUCTION", "READER_RULE", "TIMESTAMP_RULE"]
 for name in SHARED:
     block = getattr(I, name)
     for driver, prompt in (("course", B.SYSTEM_PROMPT),

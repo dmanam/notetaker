@@ -79,6 +79,28 @@ from writing more than the lecture supports:
 # Both documents load cleveref, so both get the same rule. \ref is banned
 # rather than merely discouraged: it prints a bare number, and a reader who
 # meets "by 2.3" has to go and find out what kind of thing 2.3 is.
+READER_RULE = r"""- Write for a reader who has the notes and the video, and nothing else. The
+  transcript and the board stills are your working materials, not the
+  document's: the reader cannot open them, and a board has no number as far
+  as they are concerned. So the prose may not point at them — no "the
+  transcript says", no "as seen in board 7", no "the still at 00:14:02", no
+  "the audio is unclear here". Where you need to point at something drawn or
+  written, point at it the way the lecture does: "the diagram above", "the
+  square the lecturer drew", "what was written on the board".
+  Two places are not the prose and are exempt, because neither is part of
+  what a reader reads:
+  - a LaTeX comment. The "% board N @ hh:mm:ss" line above a diagram is
+    provenance for whoever later checks the notes against the source, is
+    invisible in the PDF, and stays.
+  - a \todo. Those are working notes addressed to the person running this,
+    who does have the transcript and the boards, so name what you actually
+    need looked at: \todo{board 3 illegible here — check the exponent} is
+    more use than a version that talks around it.
+  So the rule is about the notes themselves. Where something is unresolved,
+  the sentence a reader sees says what is unclear about the mathematics, and
+  the \todo beside it says where to go and look."""
+
+
 TIMESTAMP_RULE = r"""- Mark where the material starts in the recording. Begin every paragraph
   that came from the lecture with \ts{hh:mm:ss}, and put the same mark
   immediately after \begin{theorem}, \begin{definition}, \begin{proof} and
