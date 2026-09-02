@@ -777,7 +777,7 @@ def build_tools(ctx: NotesToolContext) -> list[dict]:
                 "page) ALSO pass title, author, and year: you almost always "
                 "know or can look them up, and without an author the entry "
                 "gets an ugly placeholder citation label instead of a proper "
-                "one like [Sch19]. Safe to call repeatedly for the same "
+                "one like [Bou19]. Safe to call repeatedly for the same "
                 "source — it returns the existing key. Cite the sources the "
                 "lecturer names, and the references you consulted for "
                 "definitions or notation. Never hand-write bibliography "

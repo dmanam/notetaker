@@ -11,6 +11,7 @@ The other half is the bibliography. The model is told never to write biblatex
 machinery, which is only honest if something else writes it: the course
 assembles its preamble, and a single lecture gets it attached afterwards.
 """
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -46,7 +47,42 @@ for flag in (True, False):
                  "not an idealised one"):
         assert tail in I.diagram_rules(flag), (flag, tail)
     assert "the bibliography is assembled automatically" in I.cite_rule(flag)
+    # The two ways a source ends up outside the bibliography: written
+    # out in prose or in a footnote, and invented for a source too
+    # vague to identify.
+    assert "is not a\n  substitute for \\cite" in I.cite_rule(flag)
+    assert "without inventing bibliographic" in I.cite_rule(flag)
 print("diagram and citation rules differ only in their tool clause")
+
+# --- the checking pass is shared too ----------------------------------------
+# It used to live in build_course, so a single lecture was written and never
+# checked: the writer read the transcript into notes and nothing read the
+# notes back against the transcript. The same prompt now serves both, which
+# is only true if the course's copy is exactly what it was.
+assert I.verify_prompt(shared=True) == B.VERIFY_PROMPT
+for flag in (True, False):
+    prompt = I.verify_prompt(shared=flag)
+    for check in ("FALSE AS WRITTEN", "LOST HEDGES AND LOST CORRECTIONS",
+                  "ANACHRONISTIC OR WRONG CITATIONS",
+                  "DIAGRAMS THAT DO NOT MAKE SENSE",
+                  "Replace any bibliography written by hand"):
+        assert check in prompt, (flag, check)
+# The two clauses that genuinely differ: a course bibliography is read by
+# lectures the checker cannot see, and a course label is what they cite.
+assert "every later lecture reads" in I.verify_prompt(shared=True)
+assert "these notes print" in I.verify_prompt(shared=False)
+assert "later lectures cite them" in I.verify_prompt(shared=True)
+assert "the notes cross-reference them" in I.verify_prompt(shared=False)
+print("the checking pass is one prompt, differing in two clauses")
+
+# And it actually runs on a single lecture, rather than merely existing.
+gen = (ROOT / "generate_notes.py").read_text()
+assert "verify_prompt(shared=False)" in gen, "the pass would use no prompt"
+assert "verify(lecture_dir, output_path, backend, model, frame_model" in gen, \
+    "generate() never calls it"
+assert '"--no-verify"' in gen and '"--verify"' in gen, \
+    "no way to skip it, and no way to run it on its own"
+print("generate_notes: runs the checking pass, and can skip or repeat it")
 
 # --- the rules the drift produced -------------------------------------------
 # The single-lecture prompt asked for \ref for years after the course prompt
@@ -105,11 +141,26 @@ print("attach_to_document: declines a hand-written list and a body fragment")
 # The prompt telling the model to call cite_reference is worthless if the
 # context never sets bib_file, which is what gates the handler.
 src = (ROOT / "generate_notes.py").read_text()
-assert src.count("bib_file=output_path.parent / BIB_FILENAME") == 1 and \
-    "bib_file=bib_file" in src, \
-    "both the write and the follow-up context must carry a bib_file"
+contexts = []
+for m in re.finditer(r"NotesToolContext\(", src):
+    depth, j = 0, m.end() - 1
+    while j < len(src):
+        if src[j] == "(":
+            depth += 1
+        elif src[j] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    contexts.append(src[m.start():j])
+# Every pass that can cite has to be able to: writing, checking, following up.
+# Counting a particular spelling instead of the property is how a pass added
+# later silently gets no bibliography.
+assert len(contexts) >= 3 and all("bib_file" in c for c in contexts), \
+    f"{sum('bib_file' not in c for c in contexts)} context(s) without a bib_file"
 assert "attach_to_document(output_path" in src, \
     "nothing else writes the biblatex lines into a standalone document"
-print("generate_notes: bib_file set on both contexts, attachment wired in")
+print(f"generate_notes: bib_file on all {len(contexts)} contexts, "
+      f"attachment wired in")
 
 print("\nALL OK")

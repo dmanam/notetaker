@@ -124,6 +124,45 @@ assert "urldate" not in B.strip_redundant_url(dated), \
     "a date saying when a url was seen means nothing without the url"
 print("urldate is dropped with the url it dated")
 
+# --- bibliography the model wrote itself ------------------------------------
+# The failure this catches: the notes come back with the references written
+# out by hand — a \bibitem list, an entry pasted in, an arXiv number sitting
+# in a sentence — instead of registered with cite_reference. It compiles, it
+# looks like a bibliography, and none of it is in references.bib, so no later
+# lecture can cite the same paper and no \cite key resolves to it.
+for text, want in [
+        ("\\begin{thebibliography}{9}\n\\bibitem{BS} Bhatt, Scholze.", 2),
+        ("@article{foo2019, title={Bar}, author={Baz}}", 1),
+        ("\\bibliography{refs}", 1),
+        ("\\section*{References}", 1),
+        ("\\subsection{Bibliography}", 1),
+        ("As shown in Bhatt--Scholze, arXiv:1309.1198, the site is nice.", 1),
+        ("\\footnote{P. Scholze, \\emph{Condensed}, https://doi.org/10.1007/x}", 1),
+        # What the notes are supposed to look like instead.
+        ("See \\cite{bhatt2014} for the details.", 0),
+        ("\\printbibliography[heading=bibintoc]", 0),
+        # A comment is not the document, and the word alone is not a citation.
+        ("% see https://arxiv.org/abs/1309.1198 for the source", 0),
+        ("The lecturer posted it on the arXiv last year.", 0)]:
+    got = B.inline_entries(text)
+    assert len(got) == want, (text[:40], got)
+# The preamble legitimately carries an arxiv.org URL — it is where the
+# formatting of arXiv eprints is defined — so the scan starts at the body.
+whole = ("\\documentclass{article}\n" + (B.BIB_PREAMBLE % "references.bib")
+         + "\n\\begin{document}\n\\cite{x}\n\\printbibliography\n"
+         "\\end{document}\n")
+assert B.inline_entries(whole) == [], B.inline_entries(whole)
+# Line numbers are counted in the whole file, not in the body the scan
+# actually walks — they are what the checker is given to go and look at.
+marked = whole.replace("\\cite{x}", "\\bibitem{y} A paper.")
+want_line = next(i for i, ln in enumerate(marked.splitlines(), 1)
+                 if "bibitem" in ln)
+found = B.inline_entries(marked)
+assert len(found) == 1 and found[0].startswith(f"line {want_line}:"), \
+    (want_line, found)
+print("inline_entries: finds hand-written references, spares comments and "
+      "the preamble")
+
 root = Path(tempfile.mkdtemp())
 
 # --- over a file, and over a file twice -------------------------------------

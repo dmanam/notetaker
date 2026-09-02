@@ -479,6 +479,57 @@ def list_keys(bib_file: Path) -> list[str]:
     return re.findall(r"@\w+\s*\{\s*([^,\s]+)\s*,", bib_file.read_text())
 
 
+#: Bibliography written by hand into the notes instead of registered with
+#: cite_reference. Each pattern is something that only ever appears when the
+#: model has decided to be its own bibliography: a \bibitem list, an entry
+#: pasted straight out of a search result, a References section the assembler
+#: is already printing, or an arXiv number left in the prose where a \cite
+#: key belongs.
+_INLINE = [
+    (re.compile(r"\\begin\{thebibliography\}|\\bibitem\b"),
+     "a hand-written bibliography"),
+    (re.compile(r"^[ \t]*@\w+\s*\{", re.M),
+     "a BibTeX entry pasted into the notes"),
+    (re.compile(r"\\bibliography\s*\{"),
+     "a \\bibliography command (this course uses biblatex)"),
+    (re.compile(r"\\(?:sub)*section\*?\s*\{\s*(?:references|bibliography|"
+                r"works cited)\s*\}", re.I),
+     "a references section written by hand"),
+    (re.compile(r"arxiv:\s*\d{4}\.\d{4,5}|arxiv\.org/(?:abs|pdf)/"
+                r"|doi\.org/10\.|\\doi\s*\{", re.I),
+     "an arXiv id or DOI in the text, where a \\cite key belongs"),
+]
+
+
+def inline_entries(text: str) -> list[str]:
+    """Bibliography the model wrote itself, one finding per line found.
+
+    The bibliography is assembled from cite_reference calls, so anything of
+    this shape in the notes is a reference that never reached the .bib: it
+    renders as a second, inconsistent list of sources, it is invisible to
+    every later lecture that might have cited the same paper, and the key
+    that should point at it does not exist.
+
+    Comments are stripped first, and everything above \begin{document} is
+    skipped — the preamble legitimately contains an arxiv.org URL, because
+    that is where the formatting of arXiv eprints is defined.
+    """
+    if r"\begin{document}" in text:
+        offset = text[:text.index(r"\begin{document}")].count("\n")
+        text = text[text.index(r"\begin{document}"):]
+    else:
+        offset = 0
+    lines = [re.sub(r"(?<!\\)%.*", "", ln) for ln in text.splitlines()]
+    body = "\n".join(lines)
+    found: dict[int, str] = {}
+    for pattern, what in _INLINE:
+        for m in pattern.finditer(body):
+            num = body[:m.start()].count("\n") + offset + 1
+            excerpt = lines[num - offset - 1].strip()[:90]
+            found.setdefault(num, f"line {num}: {what} — {excerpt}")
+    return [found[n] for n in sorted(found)]
+
+
 def attach_to_document(tex_file: Path, bib_file: Path) -> bool:
     """Wire a model-written standalone document up to the .bib it cited into.
 

@@ -67,7 +67,7 @@ from ingest import (download_video, expand_playlist, extract_audio, is_url,
 from fetch import describe_assets, fetch_reference, load_cached_reference
 from agent_log import summarize
 from bibliography import (BIB_FILENAME, BIB_PREAMBLE, BIB_PRINT, has_entries,
-                          list_entries, tidy_bibliography)
+                          inline_entries, list_entries, tidy_bibliography)
 from style_extract import extract as extract_style
 from boards import analyse
 from lecturer import (ATTRIBUTION_INSTRUCTION, lecturer_note,
@@ -85,7 +85,7 @@ from instructions import (ASK_USER_RULE, ASR_INSTRUCTION, CLARIFY_RULE,
                           FIDELITY_INSTRUCTION, FRAMES_RULE,
                           HOUSE_STYLE_INSTRUCTION, MACRO_BRACING_RULE,
                           READER_RULE, TIMESTAMP_RULE, TODO_RULE,
-                          cite_rule,
+                          cite_rule, verify_prompt,
                           diagram_rules)
 from notes_tools import (NotesToolContext, REGISTER_INSTRUCTION,
                          ask_user_input, style_exemplar_block)
@@ -373,121 +373,7 @@ def warn_language_mismatch(lecture_dirs: list[Path],
 # Transcript corrections
 # ---------------------------------------------------------------------------
 
-VERIFY_PROMPT = r"""You are checking a written-up set of LaTeX lecture notes against the
-transcript of the lecture they were written from. You did not write them; read
-them as a skeptical reader who has the recording to hand.
-
-The question you are asking is NOT "does this read well?" — it reads well. It
-is "is each statement here true, and did the lecture actually support it?"
-Notes like these are usually faithful in their main content and wrong in the
-material added around it, so weight your effort towards explanation rather
-than towards the theorems themselves — but do not treat a definition or a
-theorem as safe, because added material hides inside them too.
-
-In particular, check EVERY "equivalently", "i.e.", "in other words", "that
-is", and "(equivalently, ...)" in the file, wherever it occurs — including in
-the middle of a definition, where it wears the definition's authority. Each
-one asserts that two conditions are the same, which is a real mathematical
-claim and is the single most common place a false statement hides here.
-Confirm each such claim independently, and delete any clause you cannot
-confirm: the surrounding statement is almost always fine without it.
-
-Look for exactly these, in order:
-
-1. FALSE AS WRITTEN. Any definition, theorem, or proof step that is untrue as
-   stated — dropped hypotheses (non-emptiness, finiteness, boundedness),
-   quantifiers in the wrong place, a map or implication pointing the wrong
-   way, an "equivalently" joining two genuinely different conditions, an
-   identity that does not hold, a wrong construction (a pushout where a
-   disjoint union is meant). Check the arithmetic and check the adjunctions:
-   the exactness of a left adjoint is not the exactness of its right adjoint.
-2. SELF-CONTRADICTION. A claim that contradicts another part of the same
-   notes. These are strong signals — one of the two is wrong.
-3. UNSUPPORTED ADDITIONS. Justifications, equivalences, examples, or
-   attributions with no basis in the transcript. Some are correct and
-   harmless; some are inventions. Verify each, and treat "the model made this
-   up and it happens to be true" differently from "the model made this up and
-   it is false".
-4. LOST HEDGES AND LOST CORRECTIONS. Places where the lecturer said "I think"
-   / "I forgot" / "morally" / "I don't know" and the notes assert flatly; and
-   places where the lecturer or the audience corrected something and the
-   notes preserve the superseded version, or reuse a refuted example.
-5. GARBLE PROPAGATED. Speech-recognition nonsense reproduced as if it were
-   mathematics ("very closed maps", "corner terms", "from M to M"). The
-   transcript is unreliable, so distinguish three cases: the notes are wrong;
-   the notes correctly REPAIRED a garble (leave it alone — that is the system
-   working); the notes carried a garble through (fix or flag it).
-6. ANACHRONISTIC OR WRONG CITATIONS. Check names and attributions against the
-   literature; you have web search and fetch. A work that postdates the
-   lecture is a flag, not a verdict: lecturers point at work that is not out
-   yet, their own and other people's, so a later preprint can be exactly what
-   was meant. Ask what the transcript supports. If the lecturer described the
-   work — announced the result, named the authors, called it forthcoming —
-   the citation is right and the date is not an objection. If they only
-   gestured and the notes have filled the gesture with a paper that merely
-   fits, that is an invented attribution: reduce it to the notes' own pointer
-   ("see also") or remove it.
-7. DIAGRAMS THAT DO NOT MAKE SENSE. A tikzcd in the file was either read off
-   a photograph of a blackboard or composed from the mathematics. Both go
-   wrong in ways prose does not: reading chalk is unreliable in specific ways
-   — an arrowhead is a few strokes, a superscript is a smudge, an object off
-   to one side gets missed — and a composed diagram can quietly assert a map
-   the lecture never claimed. Either way, do not check by re-reading the
-   board; check as mathematics, which is what the photograph cannot argue
-   with and what the composition has to answer to. Take each diagram and ask:
-   - Does every arrow have a source and target it could possibly go between?
-     A map into a category's opposite, a lift pointing away from the thing
-     being lifted, a surjection running from the small object onto the large
-     one, an inclusion pointing outwards — each of these is what a misread
-     arrowhead looks like from the inside.
-   - Do composites compose? If two arrows are meant to commute with a third,
-     the types have to line up; when they do not, one arrow is reversed.
-   - Does the diagram agree with the prose beside it? A paragraph saying
-     "S_n surjects onto M_n" above a diagram drawing M_n -> S_n is the most
-     reliable signal there is, and one of the two is wrong.
-   - Is a variance decoration (an op, a contravariant hom) consistent with
-     how the functor is used? An "op" that appears nowhere in the surrounding
-     text is more likely a misread than a real one.
-   - Is an object referred to in the text but absent from the diagram? Things
-     dropped in the reading leave that trace and nothing else.
-   - Does the lecture actually claim every map drawn? A composed diagram is a
-     presentation of what was said, and an arrow added to make the picture
-     look complete is an invented theorem.
-   Where the mathematics settles it, fix the diagram. Where it does not, add
-   a \todo naming the arrow you doubt. A diagram is a mathematical assertion:
-   a reversed arrow is a false theorem drawn beautifully.
-
-Then fix what you found, editing the file in place:
-- Fix anything you are confident is wrong, with the smallest edit that makes
-  it true. Do not restructure, do not rewrite prose you merely dislike, and
-  do not delete correct mathematics.
-- Where you suspect a problem but cannot settle it, leave the text and add a
-  \todo{...} saying precisely what you doubt. Do not assert and flag: if the
-  claim may be false, weaken the claim.
-- Take out anything in the PROSE that points at the working materials: the
-  transcript, a numbered board, a still. The reader has the notes and the
-  video and nothing else, so "board 7 shows" must become what board 7 showed,
-  and "the transcript is garbled here" must become what is actually unclear
-  about the mathematics. This does not apply to \todo notes or to LaTeX
-  comments — both are addressed to whoever is running this, not to the
-  reader, and naming a board in them is useful. Leave those alone.
-- Preserve every \label{} — later lectures cite them.
-- Preserve every \ts{hh:mm:ss} — it is where that material starts in the
-  recording, and it is how a reader checks the notes against the video. If
-  you split a paragraph in two, mark the new one with the time its own
-  material starts; if you merge two, keep the earlier mark. A paragraph you
-  write yourself gets no mark — an unmarked paragraph is one the lecture did
-  not say, which is worth seeing.
-- Correct how the notes name the lecturer, if they get it wrong: a first name,
-  "the speaker", "our lecturer", or a name where the task says none is on
-  record. That is a word-level edit, not a licence to rewrite the prose around
-  it. Attributing something to the wrong person, on the other hand, belongs
-  under UNSUPPORTED ADDITIONS above.
-
-Finally, reply with a short report: one line per change made, and one line
-per doubt you flagged. If the notes are clean, say so; do not invent work."""
-
-VERIFY_PROMPT += ATTRIBUTION_INSTRUCTION
+VERIFY_PROMPT = verify_prompt(shared=True)
 
 
 def _section_title(body: str) -> str:
@@ -636,6 +522,43 @@ def looks_like_section(text: str) -> tuple[bool, str]:
         return False, (f"it contains {envs} theorem/equation environment(s); "
                        f"a lecture has dozens")
     return True, ""
+
+
+def hand_written_references(section_file: Path) -> list[str]:
+    """References the model wrote out itself instead of registering.
+
+    Finding these is a scan, so code does it rather than asking the model to
+    audit its own draft — an audit it has every reason to believe it has
+    already passed. Fixing them needs to know what the source actually is,
+    which is why the list is handed to the checker rather than applied here.
+    """
+    try:
+        return inline_entries(Path(section_file).read_text())
+    except OSError:
+        return []
+
+
+def report_hand_written_references(section_file: Path) -> list[str]:
+    hits = hand_written_references(section_file)
+    if hits:
+        print(f"\n    Warning: {len(hits)} reference(s) written by hand in "
+              f"{Path(section_file).name} — these never reached "
+              f"{BIB_FILENAME}, so nothing \\cite{{}}s them:")
+        for h in hits[:5]:
+            print(f"      {h}")
+    return hits
+
+
+def hand_written_note(section_file: Path) -> str:
+    """The same list, addressed to the checker."""
+    hits = hand_written_references(section_file)
+    if not hits:
+        return ""
+    return ("**References written by hand.** A scan of the file found these "
+            "places where a source was written into the notes instead of "
+            "registered with cite_reference. Fix each one as described in "
+            "your instructions:\n\n"
+            + "\n".join(f"  - {h}" for h in hits) + "\n\n")
 
 
 def report_placeholders(section_file: Path) -> list[str]:
@@ -1032,6 +955,7 @@ def generate_section(
         print(f"\n    ({ctx.frame_requests} frame(s) fetched)", end="")
     report_unread_boards(ctx, boards)
     report_placeholders(lecture_dir / "section.tex")
+    report_hand_written_references(lecture_dir / "section.tex")
     # Questions are asked *during* the write pass, and the agent has already
     # used the answers in the text it just wrote — so they are applied, and
     # must be recorded as such. Without this every answer given while writing
@@ -2022,6 +1946,7 @@ def revise_lecture(output_root: Path, state: dict, slug: str,
     )
     report_unread_boards(ctx, boards, role="revise")
     report_placeholders(section_file)
+    report_hand_written_references(section_file)
 
     # The notes now contain these answers; don't re-deliver them next run.
     mark_answers_applied(ctx, section_file)
@@ -2084,6 +2009,7 @@ def verify_lecture(output_root: Path, state: dict, slug: str, backend: str,
         f"board.\n\n"
         f"{lecture_index(output_root, state, slug)}"
         f"{bibliography_index(output_root / BIB_FILENAME)}"
+        f"{hand_written_note(section_file)}"
         f"{board_index(boards, attached=backend == 'api')}"
         f"**Transcript:**\n\n"
         f"{format_transcript(segments, board_marks(boards))}"
@@ -2104,6 +2030,7 @@ def verify_lecture(output_root: Path, state: dict, slug: str, backend: str,
     )
     report_unread_boards(ctx, boards, role="verify")
     report_placeholders(section_file)
+    report_hand_written_references(section_file)
     state["sections"][slug]["body"] = body.strip()
     merge_section_usage(state, slug, ctx.usage)
     run_usage.add(ctx.usage)

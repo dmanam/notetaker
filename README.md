@@ -181,8 +181,9 @@ Every lecture is re-read by a second pass in a fresh context (see
 `--no-verify` skips it, and it can be run on its own:
 
 ```sh
-python build_course.py --verify <slug>   # one lecture
-python build_course.py --verify all      # the whole course
+python build_course.py --verify <slug>            # one lecture
+python build_course.py --verify all               # the whole course
+python generate_notes.py output/<slug> --verify   # a single-lecture run
 ```
 
 ### Who is lecturing

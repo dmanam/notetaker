@@ -34,7 +34,7 @@ import json
 import sys
 from pathlib import Path
 
-from bibliography import (BIB_FILENAME, attach_to_document,
+from bibliography import (BIB_FILENAME, attach_to_document, inline_entries,
                           tidy_bibliography)
 from timestamps import attach_macro, read_video_id
 from claude_backend import (BACKENDS, collect_followup_answers, count_todos,
@@ -46,7 +46,7 @@ from instructions import (ASK_USER_RULE, ASR_INSTRUCTION, CLARIFY_RULE,
                           FIDELITY_INSTRUCTION, FRAMES_RULE,
                           HOUSE_STYLE_INSTRUCTION, MACRO_BRACING_RULE,
                           READER_RULE, TIMESTAMP_RULE, TODO_RULE,
-                          cite_rule,
+                          cite_rule, verify_prompt,
                           diagram_rules)
 from media import find_video, format_transcript
 from notes_tools import (NotesToolContext, REGISTER_INSTRUCTION,
@@ -106,6 +106,46 @@ SYSTEM_PROMPT += (REGISTER_INSTRUCTION + HOUSE_STYLE_INSTRUCTION
 # ---------------------------------------------------------------------------
 # Compile check, with the model fixing what it broke
 # ---------------------------------------------------------------------------
+
+def hand_written_note(tex_file: Path) -> str:
+    """The hand-written references in a file, addressed to the checking pass.
+
+    Handed over as a list rather than left to be noticed: finding them is a
+    scan, which code does exactly and a model asked to audit its own draft
+    does not.
+    """
+    hits = _hand_written(tex_file)
+    if not hits:
+        return ""
+    return ("**References written by hand.** A scan of the file found these "
+            "places where a source was written into the notes instead of "
+            "registered with cite_reference. Fix each one as described in "
+            "your instructions:\n\n"
+            + "\n".join(f"  - {h}" for h in hits) + "\n\n")
+
+
+def _hand_written(tex_file: Path) -> list[str]:
+    try:
+        return inline_entries(Path(tex_file).read_text())
+    except OSError:
+        return []
+
+
+def report_hand_written(tex_file: Path) -> list[str]:
+    """References written into the notes instead of registered.
+
+    Reported rather than repaired: knowing what the source actually is takes
+    a model, and this driver has no second pass to hand the list to.
+    """
+    hits = _hand_written(tex_file)
+    if hits:
+        print(f"\n  Warning: {len(hits)} reference(s) written by hand in "
+              f"{Path(tex_file).name} — these never reached {BIB_FILENAME}, "
+              f"so nothing \\cite{{}}s them:")
+        for h in hits[:5]:
+            print(f"    {h}")
+    return hits
+
 
 def check_and_fix(output_path: Path, ctx_factory, backend: str,
                   model: str | None, frame_model: str | None,
@@ -182,7 +222,8 @@ def generate(lecture_dir: Path, title: str | None, output_path: Path,
              frame_model: str | None = None, wait: bool = False,
              fix_rounds: int = 2,
              style_exemplars: list | None = None,
-             lecturer: str | None = None) -> None:
+             lecturer: str | None = None,
+             verify_after: bool = True) -> None:
     # Load transcript
     transcript_path = lecture_dir / "transcript.json"
     if not transcript_path.exists():
@@ -257,8 +298,73 @@ def generate(lecture_dir: Path, title: str | None, output_path: Path,
 
     print(f"\nDone. Frame requests: {ctx.frame_requests}")
     print(f"LaTeX saved to: {output_path}")
+    report_hand_written(output_path)
+    # Before the compile loop, as the course build does: the checking pass
+    # edits the notes, so it is the version it leaves behind that has to
+    # compile.
+    if verify_after:
+        verify(lecture_dir, output_path, backend, model, frame_model, title,
+               lecturer)
     check_and_fix(output_path, make_ctx, backend, model, frame_model,
                   fix_rounds)
+
+
+# ---------------------------------------------------------------------------
+# The checking pass
+# ---------------------------------------------------------------------------
+
+def verify(lecture_dir: Path, output_path: Path, backend: str,
+           model: str | None, frame_model: str | None,
+           title: str | None = None, lecturer: str | None = None) -> None:
+    """Re-read the finished notes against the transcript, in a fresh context.
+
+    The same second pass the course build runs, and here for the same reason:
+    the writer has read the transcript into notes and cannot see what it left
+    behind, while a reader who starts from the notes and has the recording
+    can. It is also where a hand-written bibliography gets turned back into
+    real citations — the scan below finds them, and this pass has the tool
+    and the judgment to register the sources properly.
+    """
+    transcript_path = lecture_dir / "transcript.json"
+    if not transcript_path.exists():
+        print(f"  (no transcript in {lecture_dir} — skipping verification)")
+        return
+    with open(transcript_path) as f:
+        data = json.load(f)
+    segments = data.get("segments", [])
+    if not segments:
+        print("  (empty transcript — skipping verification)")
+        return
+
+    video_path = find_video(lecture_dir)
+    ctx = NotesToolContext(
+        refs_dir=lecture_dir / "references",
+        video_path=video_path,
+        total_duration=segments[-1]["end"],
+        transcript_path=transcript_path,
+        bib_file=output_path.parent / BIB_FILENAME,
+    )
+    user_text = (
+        f"Check the notes in `{output_path}`.\n\n"
+        f"{lecturer_note(lecturer)}"
+        + (f"You may consult the video frames to check anything read off the "
+           f"board.\n\n" if video_path else "")
+        + f"{hand_written_note(output_path)}"
+        f"**Transcript:**\n\n{format_transcript(segments)}"
+    )
+    print("\nChecking the notes against the transcript…")
+    run_agent(
+        system_prompt=verify_prompt(shared=False),
+        user_text=user_text,
+        ctx=ctx,
+        output_file=output_path,
+        backend=backend,
+        model=model,
+        frame_model=frame_model,
+        revise=True,
+        role="verify", log_dir=lecture_dir / "logs",
+    )
+    report_hand_written(output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +429,7 @@ def answer_followup(lecture_dir: Path, output_path: Path,
     )
     mark_answers_applied(ctx, output_path)
     print(f"\nRevised: {output_path}")
+    report_hand_written(output_path)
     check_and_fix(output_path, make_ctx, backend, model, frame_model,
                   fix_rounds)
 
@@ -366,6 +473,13 @@ def main():
                              "an earlier run and have the agent revise the "
                              "existing notes (also sweeps remaining \\todo "
                              "markers).")
+    parser.add_argument("--verify", action="store_true",
+                        help="Run only the checking pass over notes an "
+                             "earlier run already wrote.")
+    parser.add_argument("--no-verify", dest="verify_after", default=True,
+                        action="store_false",
+                        help="Skip the checking pass that normally follows "
+                             "writing.")
     parser.add_argument("--lecturer", metavar="NAME", default=None,
                         help="Who gave this lecture. The notes refer to them "
                              "by surname, as published notes do. Without this "
@@ -387,6 +501,25 @@ def main():
 
     output_path = Path(args.output) if args.output else lecture_dir / "notes.tex"
     refs_dir = lecture_dir / "references"
+
+    if args.verify:
+        names = resolve_lecturers([lecture_dir], {}, forced=args.lecturer,
+                                  backend=args.backend, model=args.model,
+                                  frame_model=args.frame_model,
+                                  work_dir=lecture_dir / "lecturers",
+                                  log_dir=lecture_dir / "logs")
+        verify(lecture_dir, output_path.resolve(), args.backend, args.model,
+               args.frame_model, args.title,
+               lecturer=names.get(lecture_dir.name))
+        check_and_fix(output_path.resolve(),
+                      lambda: NotesToolContext(
+                          refs_dir=refs_dir,
+                          video_path=find_video(lecture_dir),
+                          transcript_path=lecture_dir / "transcript.json",
+                          bib_file=output_path.resolve().parent / BIB_FILENAME),
+                      args.backend, args.model, args.frame_model,
+                      args.latex_fix_rounds)
+        return
 
     if args.answer:
         answer_followup(lecture_dir, output_path.resolve(), args.backend,
@@ -412,7 +545,8 @@ def main():
     generate(lecture_dir, args.title, output_path, references,
              args.backend, args.model, args.frame_model, args.wait,
              args.latex_fix_rounds, args.style_exemplar,
-             lecturer=names.get(lecture_dir.name))
+             lecturer=names.get(lecture_dir.name),
+             verify_after=args.verify_after)
 
 
 if __name__ == "__main__":

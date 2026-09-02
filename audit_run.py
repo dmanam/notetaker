@@ -31,6 +31,7 @@ import json
 import re
 from pathlib import Path
 
+from bibliography import inline_entries
 from timestamps import marks
 
 
@@ -178,7 +179,7 @@ def main() -> None:
     print(f"{'#':>3} {'lecture':40s} {'kB':>5} {'cue':>4} {'diag':>4} "
           f"{'prov':>4} {'eq':>3} {'todo':>4} {'ts':>4} {'W':>7} {'V':>4} "
           f"{'?':>2}")
-    flagged, dropped, unmarked, leaking = [], [], [], []
+    flagged, dropped, unmarked, leaking, byhand = [], [], [], [], []
     totals = dict(diag=0, prov=0, todo=0, q=0, cue=0, ts=0)
     for slug in order:
         d = root / slug
@@ -208,6 +209,11 @@ def main() -> None:
         leaks = artifact_mentions(text)
         if leaks:
             leaking.append((slug, leaks))
+        # References the writer wrote out itself. The checking pass turns
+        # these back into real citations, so any left here survived it.
+        hand = inline_entries(text)
+        if hand:
+            byhand.append((slug, len(hand)))
         short = w is not None and total and w < total
         if short:
             flagged.append((slug, w, total))
@@ -219,6 +225,11 @@ def main() -> None:
               f"{(str(w) + '/' + str(total)):>7}{'!' if short else ' '} "
               f"{(v if v is not None else '-'):>4} {q:>2}")
 
+    if byhand:
+        print("\nSections with references written by hand — these never "
+              f"reached the bibliography, so nothing \\cite{{}}s them:")
+        for slug, n in byhand:
+            print(f"  {slug}: {n} place(s)")
     if leaking:
         print("\nSections whose prose points at the transcript or a numbered "
               "board — the reader has neither:")

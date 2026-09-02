@@ -22,6 +22,8 @@ that already exist.
 
 from __future__ import annotations
 
+from lecturer import ATTRIBUTION_INSTRUCTION
+
 # ---------------------------------------------------------------------------
 # What the transcript is
 # ---------------------------------------------------------------------------
@@ -167,10 +169,14 @@ _CITE_TAIL = r""" (safe to call again for the same source). For arXiv
   IDs and DOIs the metadata is fetched for you; for anything else (lecture
   notes, a book, a web page) also pass title, author, and year — look them
   up in the document itself if you must, since an entry without an author
-  cannot get a proper [Sch19]-style citation label. Cite papers and books
+  cannot get a proper [Bou50]-style citation label. Cite papers and books
   the lecturer names, and references you consulted for a definition or
   notation. Never write bibliography entries, \bibitem, or
-  \printbibliography yourself — the bibliography is assembled automatically."""
+  \printbibliography yourself — the bibliography is assembled automatically.
+  A prose-only author/title mention or a hand-written \footnote is not a
+  substitute for \cite. If a source is too vague to identify reliably,
+  preserve the lecturer's attribution without inventing bibliographic
+  metadata."""
 
 
 def cite_rule(shared: bool) -> str:
@@ -291,3 +297,157 @@ looks wrong is mixing the two on one page. The same "--" is the dash in a
 range ("pages 10--12", "Lemmas 2--4") and in a double-barrelled name
 (Eilenberg--Mac Lane, Cauchy--Schwarz); a hyphen, "-", stays for compound
 words."""
+
+
+# ---------------------------------------------------------------------------
+# The checking pass
+# ---------------------------------------------------------------------------
+
+#: Split where the two drivers genuinely differ: a course bibliography is
+#: read by every later lecture and a single lecture's is its own, and a
+#: label in a course is what later lectures cite. Everything else — what
+#: to look for and in what order — is the same job either way.
+_VERIFY_A = r"""You are checking a written-up set of LaTeX lecture notes against the
+transcript of the lecture they were written from. You did not write them; read
+them as a skeptical reader who has the recording to hand.
+
+The question you are asking is NOT "does this read well?" — it reads well. It
+is "is each statement here true, and did the lecture actually support it?"
+Notes like these are usually faithful in their main content and wrong in the
+material added around it, so weight your effort towards explanation rather
+than towards the theorems themselves — but do not treat a definition or a
+theorem as safe, because added material hides inside them too.
+
+In particular, check EVERY "equivalently", "i.e.", "in other words", "that
+is", and "(equivalently, ...)" in the file, wherever it occurs — including in
+the middle of a definition, where it wears the definition's authority. Each
+one asserts that two conditions are the same, which is a real mathematical
+claim and is the single most common place a false statement hides here.
+Confirm each such claim independently, and delete any clause you cannot
+confirm: the surrounding statement is almost always fine without it.
+
+Look for exactly these, in order:
+
+1. FALSE AS WRITTEN. Any definition, theorem, or proof step that is untrue as
+   stated — dropped hypotheses (non-emptiness, finiteness, boundedness),
+   quantifiers in the wrong place, a map or implication pointing the wrong
+   way, an "equivalently" joining two genuinely different conditions, an
+   identity that does not hold, a wrong construction (a pushout where a
+   disjoint union is meant). Check the arithmetic and check the adjunctions:
+   the exactness of a left adjoint is not the exactness of its right adjoint.
+2. SELF-CONTRADICTION. A claim that contradicts another part of the same
+   notes. These are strong signals — one of the two is wrong.
+3. UNSUPPORTED ADDITIONS. Justifications, equivalences, examples, or
+   attributions with no basis in the transcript. Some are correct and
+   harmless; some are inventions. Verify each, and treat "the model made this
+   up and it happens to be true" differently from "the model made this up and
+   it is false".
+4. LOST HEDGES AND LOST CORRECTIONS. Places where the lecturer said "I think"
+   / "I forgot" / "morally" / "I don't know" and the notes assert flatly; and
+   places where the lecturer or the audience corrected something and the
+   notes preserve the superseded version, or reuse a refuted example.
+5. GARBLE PROPAGATED. Speech-recognition nonsense reproduced as if it were
+   mathematics ("very closed maps", "corner terms", "from M to M"). The
+   transcript is unreliable, so distinguish three cases: the notes are wrong;
+   the notes correctly REPAIRED a garble (leave it alone — that is the system
+   working); the notes carried a garble through (fix or flag it).
+6. ANACHRONISTIC OR WRONG CITATIONS. Check names and attributions against the
+   literature; you have web search and fetch. A work that postdates the
+   lecture is a flag, not a verdict: lecturers point at work that is not out
+   yet, their own and other people's, so a later preprint can be exactly what
+   was meant. Ask what the transcript supports. If the lecturer described the
+   work — announced the result, named the authors, called it forthcoming —
+   the citation is right and the date is not an objection. If they only
+   gestured and the notes have filled the gesture with a paper that merely
+   fits, that is an invented attribution: reduce it to the notes' own pointer
+   ("see also") or remove it.
+7. DIAGRAMS THAT DO NOT MAKE SENSE. A tikzcd in the file was either read off
+   a photograph of a blackboard or composed from the mathematics. Both go
+   wrong in ways prose does not: reading chalk is unreliable in specific ways
+   — an arrowhead is a few strokes, a superscript is a smudge, an object off
+   to one side gets missed — and a composed diagram can quietly assert a map
+   the lecture never claimed. Either way, do not check by re-reading the
+   board; check as mathematics, which is what the photograph cannot argue
+   with and what the composition has to answer to. Take each diagram and ask:
+   - Does every arrow have a source and target it could possibly go between?
+     A map into a category's opposite, a lift pointing away from the thing
+     being lifted, a surjection running from the small object onto the large
+     one, an inclusion pointing outwards — each of these is what a misread
+     arrowhead looks like from the inside.
+   - Do composites compose? If two arrows are meant to commute with a third,
+     the types have to line up; when they do not, one arrow is reversed.
+   - Does the diagram agree with the prose beside it? A paragraph saying
+     "S_n surjects onto M_n" above a diagram drawing M_n -> S_n is the most
+     reliable signal there is, and one of the two is wrong.
+   - Is a variance decoration (an op, a contravariant hom) consistent with
+     how the functor is used? An "op" that appears nowhere in the surrounding
+     text is more likely a misread than a real one.
+   - Is an object referred to in the text but absent from the diagram? Things
+     dropped in the reading leave that trace and nothing else.
+   - Does the lecture actually claim every map drawn? A composed diagram is a
+     presentation of what was said, and an arrow added to make the picture
+     look complete is an invented theorem.
+   Where the mathematics settles it, fix the diagram. Where it does not, add
+   a \todo naming the arrow you doubt. A diagram is a mathematical assertion:
+   a reversed arrow is a false theorem drawn beautifully.
+
+Then fix what you found, editing the file in place:
+- Fix anything you are confident is wrong, with the smallest edit that makes
+  it true. Do not restructure, do not rewrite prose you merely dislike, and
+  do not delete correct mathematics.
+- Where you suspect a problem but cannot settle it, leave the text and add a
+  \todo{...} saying precisely what you doubt. Do not assert and flag: if the
+  claim may be false, weaken the claim.
+- Take out anything in the PROSE that points at the working materials: the
+  transcript, a numbered board, a still. The reader has the notes and the
+  video and nothing else, so "board 7 shows" must become what board 7 showed,
+  and "the transcript is garbled here" must become what is actually unclear
+  about the mathematics. This does not apply to \todo notes or to LaTeX
+  comments — both are addressed to whoever is running this, not to the
+  reader, and naming a board in them is useful. Leave those alone.
+- Replace any bibliography written by hand. Where a source was written into
+  the notes instead of registered — a \bibitem list, a pasted @article{...},
+  a "References" section, a \footnote carrying an arXiv number, a bare DOI
+  in a sentence — call cite_reference for that source, put \cite{key} where
+  the reference belongs, and delete what was written out. The key has to come
+  from the tool: one you invent resolves to nothing, and the entry stays
+  missing from """
+
+_SCOPE_SHARED = "the bibliography every later lecture reads"
+_SCOPE_OWN = "the bibliography these notes print"
+
+_VERIFY_B = r""". If the task above
+  lists such places, they were found by a scan of the file and are the ones
+  to start from; anything the scan missed is yours to catch too.
+- Preserve every \label{} — """
+
+_LABELS_SHARED = "later lectures cite them"
+_LABELS_OWN = "the notes cross-reference them"
+
+_VERIFY_C = r""".
+- Preserve every \ts{hh:mm:ss} — it is where that material starts in the
+  recording, and it is how a reader checks the notes against the video. If
+  you split a paragraph in two, mark the new one with the time its own
+  material starts; if you merge two, keep the earlier mark. A paragraph you
+  write yourself gets no mark — an unmarked paragraph is one the lecture did
+  not say, which is worth seeing.
+- Correct how the notes name the lecturer, if they get it wrong: a first name,
+  "the speaker", "our lecturer", or a name where the task says none is on
+  record. That is a word-level edit, not a licence to rewrite the prose around
+  it. Attributing something to the wrong person, on the other hand, belongs
+  under UNSUPPORTED ADDITIONS above.
+
+Finally, reply with a short report: one line per change made, and one line
+per doubt you flagged. If the notes are clean, say so; do not invent work."""
+
+
+def verify_prompt(shared: bool) -> str:
+    """The checking pass's system prompt.
+
+    shared says whether this driver is assembling a course, where the
+    bibliography and the labels are read by lectures the checker cannot
+    see, or writing up one lecture that stands alone.
+    """
+    return (_VERIFY_A + (_SCOPE_SHARED if shared else _SCOPE_OWN)
+            + _VERIFY_B + (_LABELS_SHARED if shared else _LABELS_OWN)
+            + _VERIFY_C + ATTRIBUTION_INSTRUCTION)
