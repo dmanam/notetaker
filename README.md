@@ -12,6 +12,9 @@ A whole series becomes one `course.tex`, with cross-references between
 lectures, a running bibliography, and a compile-repair loop that fixes its own
 LaTeX errors.
 
+For an example of course notes produced with this, see
+[dmanam/analyticstacksnotes](https://github.com/dmanam/analyticstacksnotes).
+
 - [Requirements](#requirements)
 - [Install](#install)
 - [Quickstart](#quickstart)
